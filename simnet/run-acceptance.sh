@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# Full two-player dcr4inarow acceptance test.
+#
+# This script uses fixed, public simnet-only wallet seeds. It creates isolated
+# state below /tmp, starts two independent wallets, bridges and game processes,
+# and proves both cooperative payout and unilateral mature recovery.
+set -Eeuo pipefail
+
+GAME_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+SRC_ROOT=${SRC_ROOT:-$(cd "$GAME_REPO/../.." && pwd)}
+SDK_REPO=${SDK_REPO:-$SRC_ROOT/karamble/dcrgaming-sdk}
+PULSE_REPO=${PULSE_REPO:-$SRC_ROOT/karamble/dcrpulse}
+DCRD_REPO=${DCRD_REPO:-$SRC_ROOT/decred/dcrd}
+WALLET_REPO=${WALLET_REPO:-$SRC_ROOT/decred/dcrwallet}
+BR_REPO=${BR_REPO:-$SRC_ROOT/companyzero/bisonrelay}
+BRCLIENT_REPO=${BRCLIENT_REPO:-$SRC_ROOT/karamble/brclientd}
+TEST_ROOT=${DCR4INAROW_SIMNET_ROOT:-/tmp/dcr4inarow-simnet-acceptance}
+BIN=$TEST_ROOT/bin
+RUN=$TEST_ROOT/run
+LOG=$RUN/logs
+
+RPC_USER=dcr4inarow-simnet
+RPC_PASS=dcr4inarow-simnet-pass
+WALLET_PASS=123
+# What the second wallet needs: a buy-in and an admission bond are together far
+# under a coin, so this is generous rather than calculated.
+WALLET2_FUNDING=5
+DASHBOARD_PASS=dcr4inarow-simnet-dashboard-password
+PULSE_IMAGE=${PULSE_IMAGE:-alpine:3.22}
+PULSE1=d4-simnet-pulse1-$$
+PULSE2=d4-simnet-pulse2-$$
+PIDS=()
+
+say() { printf '\n==> %s\n' "$*"; }
+die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  # KEEP_RUNNING=1 leaves the whole stack up after a failure so it can be
+  # poked at. A harness that tears down the thing that broke is one you can
+  # only debug by guessing.
+  if ((status != 0)) && [[ ${KEEP_RUNNING:-0} == 1 ]]; then
+    printf '\nKEEP_RUNNING: leaving the stack up.\n  pulse1 http://127.0.0.1:19680  pulse2 http://127.0.0.1:19681\n  containers %s %s\n  run dir %s\n' "$PULSE1" "$PULSE2" "$RUN" >&2
+    exit "$status"
+  fi
+  docker rm -f "$PULSE1" "$PULSE2" >/dev/null 2>&1 || true
+  if ((${#PIDS[@]})); then
+    kill "${PIDS[@]}" >/dev/null 2>&1 || true
+    wait "${PIDS[@]}" >/dev/null 2>&1 || true
+  fi
+  if ((status != 0)); then
+    printf '\nLogs retained at %s\n' "$LOG" >&2
+    docker logs "$PULSE1" 2>&1 | tail -80 >&2 || true
+    docker logs "$PULSE2" 2>&1 | tail -80 >&2 || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+trap 'printf "FAIL: line %d: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+
+for cmd in go curl jq docker; do command -v "$cmd" >/dev/null || die "$cmd is required"; done
+for dir in "$SDK_REPO" "$PULSE_REPO/dashboard" "$DCRD_REPO" "$WALLET_REPO" "$BR_REPO" "$BRCLIENT_REPO"; do
+  test -d "$dir" || die "missing source tree: $dir"
+done
+docker image inspect "$PULSE_IMAGE" >/dev/null 2>&1 || die "Docker image $PULSE_IMAGE is required"
+
+if [[ ${SKIP_BUILD:-0} == 1 ]]; then
+  rm -rf "$RUN"
+  for binary in dcrd dcrwallet brserver brclientd dcrpulse dcr4inarow-simnet-player; do
+    test -x "$BIN/$binary" || die "SKIP_BUILD=1 but $BIN/$binary is missing"
+  done
+else
+  rm -rf "$TEST_ROOT"
+fi
+mkdir -p "$BIN" "$LOG" "$RUN"/{dcrd,brserver,wallet1,wallet2,brclient1,brclient2,player1,player2}
+
+run_bg() {
+  local name=$1; shift
+  "$@" >"$LOG/$name.log" 2>&1 &
+  PIDS+=("$!")
+}
+
+wait_http() {
+  local url=$1
+  for _ in $(seq 1 240); do
+    curl -fsS "$url" >/dev/null 2>&1 && return 0
+    sleep .25
+  done
+  die "timed out waiting for $url"
+}
+
+wait_file() {
+  local path=$1
+  for _ in $(seq 1 240); do test -s "$path" && return 0; sleep .25; done
+  die "timed out waiting for $path"
+}
+
+dcrd_rpc() {
+  local method=$1 params=${2:-'[]'}
+  curl -fsS --cacert "$RUN/dcrd/rpc.cert" --user "$RPC_USER:$RPC_PASS" \
+    -H content-type:application/json \
+    --data "$(jq -nc --arg method "$method" --argjson params "$params" '{jsonrpc:"1.0",id:"dcr4inarow",method:$method,params:$params}')" \
+    https://127.0.0.1:19556/ | jq -e '.error == null' >/dev/null
+}
+
+# An RPC that fails says what the node said. Without this a failure is a line
+# number and a swallowed body, which is most of an afternoon.
+dcrd_result() {
+  local method=$1 params=${2:-'[]'} body
+  body=$(curl -fsS --cacert "$RUN/dcrd/rpc.cert" --user "$RPC_USER:$RPC_PASS" \
+    -H content-type:application/json \
+    --data "$(jq -nc --arg method "$method" --argjson params "$params" '{jsonrpc:"1.0",id:"dcr4inarow",method:$method,params:$params}')" \
+    https://127.0.0.1:19556/) || { printf 'dcrd %s: no answer\n' "$method" >&2; return 1; }
+  jq -e '.result' <<<"$body" 2>/dev/null || {
+    printf 'dcrd %s failed: %s\n' "$method" "$body" >&2
+    return 1
+  }
+}
+
+mine() { dcrd_result generate "[$1]" >/dev/null; }
+
+wallet_result() {
+  local number=$1 port=$2 method=$3 params=${4:-'[]'} body
+  body=$(curl -fsS --cacert "$RUN/wallet$number/rpc.cert" --user "$RPC_USER:$RPC_PASS" \
+    -H content-type:application/json \
+    --data "$(jq -nc --arg method "$method" --argjson params "$params" '{jsonrpc:"1.0",id:"dcr4inarow",method:$method,params:$params}')" \
+    "https://127.0.0.1:$port/") || { printf 'wallet %s %s: no answer\n' "$number" "$method" >&2; return 1; }
+  jq -e '.result' <<<"$body" 2>/dev/null || {
+    printf 'wallet %s %s failed: %s\n' "$number" "$method" "$body" >&2
+    return 1
+  }
+}
+
+br_api() {
+  local number=$1 port=$2 path=$3; shift 3
+  curl -fsS --cacert "$RUN/brclient$number/data/simnet/rpc/rpc.cert" \
+    --cert "$RUN/brclient$number/data/simnet/rpc/rpc-client.cert" \
+    --key "$RUN/brclient$number/data/simnet/rpc/rpc-client.key" \
+    "$@" "https://127.0.0.1:$port$path"
+}
+
+# session is the dashboard cookie captured at login. A jar file is not enough:
+# the cookie has no expiry, and curl does not write session cookies to a jar,
+# so a jar-based flow authenticates exactly once and then silently stops.
+session() { cat "$RUN/pulse$1/session" 2>/dev/null; }
+
+pulse_get() {
+  local number=$1 port=$2 path=$3
+  curl -fsS -H "Cookie: $(session "$number")" "http://127.0.0.1:$port/api$path"
+}
+
+# A refused dashboard call says which gate refused it. The dashboard tags its
+# own 401 with X-Dashboard-Auth, which is the difference between "no app
+# password is enabled" and "this session is not valid".
+pulse_post() {
+  local number=$1 port=$2 path=$3 data=$4 out code
+  out=$(curl -sS -H "Cookie: $(session "$number")" \
+    -D "$RUN/pulse$number/last-headers" -o "$RUN/pulse$number/last-body" -w '%{http_code}' \
+    -H "Origin: http://127.0.0.1:$port" -H content-type:application/json \
+    --data "$data" "http://127.0.0.1:$port/api$path") || {
+    printf 'pulse %s POST %s: no answer\n' "$number" "$path" >&2
+    return 1
+  }
+  code=$out
+  if ((code < 200 || code >= 300)); then
+    printf 'pulse %s POST %s -> %s %s | %s\n' "$number" "$path" "$code" \
+      "$({ grep -i '^x-dashboard-auth:' "$RUN/pulse$number/last-headers" || true; } | tr -d '\r')" \
+      "$(head -c 400 "$RUN/pulse$number/last-body")" >&2
+    return 1
+  fi
+  cat "$RUN/pulse$number/last-body"
+}
+
+# simnet mints a block only when something asks it to, so anything waiting on a
+# confirmation waits forever unless the wait mines for itself. Pass --mine to a
+# wait that needs the chain to move. The cadence is slow and capped on purpose:
+# play carries a 12-block move deadline, and a wait that mined freely would
+# forfeit the match it was only supposed to watch.
+MINE_WHILE_WAITING=${MINE_WHILE_WAITING:-6}
+
+wait_pulse_jq() {
+  local mining=0
+  if [[ ${1:-} == --mine ]]; then mining=1; shift; fi
+  local number=$1 port=$2 path=$3 filter=$4
+  local body polls=0 mined=0
+  for _ in $(seq 1 360); do
+    body=$(pulse_get "$number" "$port" "$path" 2>/dev/null || true)
+    if test -n "$body" && jq -e "$filter" >/dev/null 2>&1 <<<"$body"; then printf '%s\n' "$body"; return 0; fi
+    polls=$((polls + 1))
+    if ((mining && mined < MINE_WHILE_WAITING && polls % 8 == 0)); then mine 1; mined=$((mined + 1)); fi
+    sleep .5
+  done
+  die "timed out waiting for pulse $number $path: $filter"
+}
+
+wait_player_jq() {
+  local mining=0
+  if [[ ${1:-} == --mine ]]; then mining=1; shift; fi
+  local port=$1 filter=$2 body polls=0 mined=0
+  for _ in $(seq 1 360); do
+    body=$(curl -fsS "http://127.0.0.1:$port/status" 2>/dev/null || true)
+    if test -n "$body" && jq -e "$filter" >/dev/null 2>&1 <<<"$body"; then printf '%s\n' "$body"; return 0; fi
+    polls=$((polls + 1))
+    if ((mining && mined < MINE_WHILE_WAITING && polls % 8 == 0)); then mine 1; mined=$((mined + 1)); fi
+    sleep .5
+  done
+  die "timed out waiting for player $port: $filter"
+}
+
+say "Build current sources"
+if [[ ${SKIP_BUILD:-0} != 1 ]]; then
+  (cd "$DCRD_REPO" && go build -o "$BIN/dcrd" .)
+  (cd "$WALLET_REPO" && go build -o "$BIN/dcrwallet" .)
+  (cd "$BR_REPO" && go build -o "$BIN/brserver" ./brserver)
+  (cd "$BRCLIENT_REPO" && go build -o "$BIN/brclientd" ./cmd/brclientd)
+  (cd "$PULSE_REPO/dashboard" && CGO_ENABLED=0 go build -o "$BIN/dcrpulse" ./cmd/dcrpulse)
+  (cd "$GAME_REPO" && go build -o "$BIN/dcr4inarow-simnet-player" ./cmd/dcr4inarow-simnet-player)
+fi
+
+cat >"$RUN/dcrd.conf" <<EOF
+[Application Options]
+simnet=1
+appdata=$RUN/dcrd
+datadir=$RUN/dcrd/data
+logdir=$RUN/dcrd/logs
+rpcuser=$RPC_USER
+rpcpass=$RPC_PASS
+rpclisten=127.0.0.1:19556
+listen=127.0.0.1:19555
+rpccert=$RUN/dcrd/rpc.cert
+rpckey=$RUN/dcrd/rpc.key
+# dcrpulse observes every gaming operation with getrawtransaction before it
+# will rebroadcast it. Without the transaction index that call fails with an
+# error dcrpulse cannot read as "not found", so the co-signed payout is
+# assembled, signed by both seats - and then never broadcast.
+txindex=1
+miningaddr=SsXciQNTo3HuV5tX3yy4hXndRWgLMRVC7Ah
+debuglevel=warn
+EOF
+cat >"$RUN/brserver.conf" <<EOF
+root=$RUN/brserver
+routedmessages=$RUN/brserver/routedmessages
+paidrvs=$RUN/brserver/paidrvs
+listen=127.0.0.1:19443
+[payment]
+scheme=free
+pushrateatoms=0.001
+pushratebytes=1
+[log]
+logfile=$RUN/brserver/brserver.log
+debuglevel=warn
+profiler=
+EOF
+
+# A previous run that was left up holds these ports, and the symptom without
+# this check is a timeout waiting for a certificate a minute later, which says
+# nothing about the cause.
+ports_free() {
+  local busy=""
+  for port in 19555 19556 19443 19557 19567 19680 19681 19690 19691 19801 19802; do
+    if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port "; then busy="$busy $port"; fi
+  done
+  if test -n "$busy"; then
+    printf 'Ports in use:%s\n' "$busy" >&2
+    pgrep -af "$BIN/" >&2 || true
+    die "another simnet run is still up; stop it with: pkill -f '$BIN/'"
+  fi
+}
+ports_free
+
+run_bg dcrd "$BIN/dcrd" -C "$RUN/dcrd.conf"
+run_bg brserver "$BIN/brserver" -cfg "$RUN/brserver.conf"
+wait_file "$RUN/dcrd/rpc.cert"
+for _ in $(seq 1 120); do dcrd_rpc getblockcount && break; sleep .25; done
+mine 2
+
+for number in 1 2; do
+  port=$((19547 + number * 10))
+  grpc=$((19548 + number * 10))
+  cat >"$RUN/wallet$number.conf" <<EOF
+[Application Options]
+simnet=1
+appdata=$RUN/wallet$number
+logdir=$RUN/wallet$number/logs
+pass=$WALLET_PASS
+rpcconnect=127.0.0.1:19556
+cafile=$RUN/dcrd/rpc.cert
+rpclisten=127.0.0.1:$port
+grpclisten=127.0.0.1:$grpc
+rpccert=$RUN/wallet$number/rpc.cert
+rpckey=$RUN/wallet$number/rpc.key
+clientcafile=$RUN/wallet$number/rpc.cert
+username=$RPC_USER
+password=$RPC_PASS
+debuglevel=warn
+EOF
+done
+
+# Public simnet fixture seeds. Never use these wallets on another network.
+printf 'y\nn\ny\nb280922d2cffda44648346412c5ec97f429938105003730414f10b01e1402eac\n\n\n' | "$BIN/dcrwallet" -C "$RUN/wallet1.conf" --create >/dev/null
+printf 'y\nn\ny\n4242424242424242424242424242424242424242424242424242424242424242\n\n\n' | "$BIN/dcrwallet" -C "$RUN/wallet2.conf" --create >/dev/null
+run_bg wallet1 "$BIN/dcrwallet" -C "$RUN/wallet1.conf"
+wallet1_pid=${PIDS[-1]}
+run_bg wallet2 "$BIN/dcrwallet" -C "$RUN/wallet2.conf"
+wallet2_pid=${PIDS[-1]}
+for _ in $(seq 1 240); do wallet_result 1 19557 getbalance >/dev/null 2>&1 && wallet_result 2 19567 getbalance >/dev/null 2>&1 && break; sleep .25; done
+mine 32
+# Mine until the coin is actually spendable rather than a fixed number of
+# blocks and a hope. A coinbase is immature for its first sixteen blocks, and
+# how many of them a wallet has seen depends on when it finished connecting -
+# so the condition to wait on is the balance, not a block count.
+balance=0
+for _ in $(seq 1 60); do
+  balance=$(wallet_result 1 19557 getbalance 2>/dev/null | jq -r '.totalspendable // (.balances[0].spendable // 0)' || echo 0)
+  awk "BEGIN {exit !($balance > $WALLET2_FUNDING)}" && break
+  mine 4
+  sleep .5
+done
+awk "BEGIN {exit !($balance > $WALLET2_FUNDING)}" ||
+  die "wallet 1 never had spendable coin (last balance $balance): $(wallet_result 1 19557 getbalance 2>&1 || true)"
+wallet2_address=$(wallet_result 2 19567 getnewaddress | jq -r .)
+wallet_result 1 19557 sendtoaddress "$(jq -nc --arg address "$wallet2_address" --argjson amount "$WALLET2_FUNDING" '[$address,$amount]')" >/dev/null
+mine 2
+
+# dcrpulse learns whether a wallet can sign from dcrwallet's OpenWalletResponse
+# and caches that answer per wallet. When the wallet is already loaded its open
+# path short-circuits, the answer is never learned, and every gaming financial
+# call fails closed with "financial authority is unavailable". Funding is done,
+# so hand the loading over to dcrpulse - which is how a real deployment drives
+# dcrwallet, and it puts dcrpulse in charge of the sync at the same time.
+kill "$wallet1_pid" "$wallet2_pid" 2>/dev/null || true
+wait "$wallet1_pid" "$wallet2_pid" 2>/dev/null || true
+run_bg wallet1 "$BIN/dcrwallet" -C "$RUN/wallet1.conf" --noinitialload
+run_bg wallet2 "$BIN/dcrwallet" -C "$RUN/wallet2.conf" --noinitialload
+
+say "Start two independent Bison Relay identities"
+run_bg brclient1 "$BIN/brclientd" --appdata="$RUN/brclient1" --simnet --brserver=127.0.0.1:19443 --brserverdirect --payscheme=free --clientrpc.listen=127.0.0.1:19760 --clientrpc.issueclientcert --status.listen=127.0.0.1:19761 --mcp.mcplisten=127.0.0.1:19762
+run_bg brclient2 "$BIN/brclientd" --appdata="$RUN/brclient2" --simnet --brserver=127.0.0.1:19443 --brserverdirect --payscheme=free --clientrpc.listen=127.0.0.1:19770 --clientrpc.issueclientcert --status.listen=127.0.0.1:19771 --mcp.mcplisten=127.0.0.1:19772
+wait_file "$RUN/brclient1/data/simnet/rpc/rpc-client.cert"
+wait_file "$RUN/brclient2/data/simnet/rpc/rpc-client.cert"
+br_api 1 19760 /create-identity -H content-type:application/json --data '{"nick":"fourinarow-one","name":"Four In A Row One"}' >/dev/null
+br_api 2 19770 /create-identity -H content-type:application/json --data '{"nick":"fourinarow-two","name":"Four In A Row Two"}' >/dev/null
+for _ in $(seq 1 240); do br_api 1 19761 /public-identity >/dev/null 2>&1 && br_api 2 19771 /public-identity >/dev/null 2>&1 && break; sleep .25; done
+
+invite=$(br_api 1 19761 /invites/create -H content-type:application/json --data '{}' | jq -r .inviteBytes)
+br_api 2 19771 /invites/accept -H content-type:application/json --data "$(jq -nc --arg inviteBytes "$invite" '{inviteBytes:$inviteBytes}')" >/dev/null
+for _ in $(seq 1 240); do
+  one=$(br_api 1 19761 /contacts 2>/dev/null || true)
+  two=$(br_api 2 19771 /contacts 2>/dev/null || true)
+  jq -e '.. | strings | select(. == "fourinarow-two")' >/dev/null 2>&1 <<<"$one" && \
+    jq -e '.. | strings | select(. == "fourinarow-one")' >/dev/null 2>&1 <<<"$two" && break
+  sleep .25
+done
+identity=$(br_api 2 19771 /public-identity | jq -r .identity)
+if [[ ! $identity =~ ^[0-9a-fA-F]{64}$ ]]; then identity=$(printf %s "$identity" | base64 -d | od -An -tx1 | tr -d ' \n'); fi
+gcid=$(br_api 1 19761 /gc/create -H content-type:application/json --data '{"name":"dcr4inarow simnet acceptance"}' | jq -r .id)
+br_api 1 19761 "/gc/$gcid/invite" -H content-type:application/json --data "$(jq -nc --arg uid "$identity" '{uid:$uid}')" >/dev/null
+invite_id=
+for _ in $(seq 1 240); do
+  invite_id=$(br_api 2 19771 /gc/invites 2>/dev/null | jq -r --arg group "$gcid" '.invites[]? | select(.gcid == $group) | .id' | head -1 || true)
+  test -n "$invite_id" && break
+  sleep .25
+done
+test -n "$invite_id" || die "group invitation did not arrive"
+br_api 2 19771 /gc/invites/accept -H content-type:application/json --data "$(jq -nc --argjson iid "$invite_id" '{iid:$iid}')" >/dev/null
+
+say "Start two independent dcrpulse bridges"
+for number in 1 2; do
+  mkdir -p "$RUN/pulse$number/app-data/control" "$RUN/pulse$number/dashboard-data/wallets/simnet/default-wallet"
+  printf '{"name":"default-wallet","appdata":"/app-data/dcrwallet","network":"simnet","epoch":1}\n' >"$RUN/pulse$number/app-data/control/selected.json"
+done
+
+start_pulse() {
+  local number=$1 wallet_rpc=$2 wallet_grpc=$3 br_rpc=$4 br_status=$5 http=$6 gaming=$7 container=$8
+  docker run -d --rm --name "$container" --network host --user 1000:1000 \
+    -v "$BIN/dcrpulse:/usr/local/bin/dcrpulse:ro" \
+    -v "$RUN/dcrd/rpc.cert:/certs/dcrd.cert:ro" \
+    -v "$RUN/wallet$number/rpc.cert:/certs/wallet.cert:ro" \
+    -v "$RUN/wallet$number/rpc.key:/certs/wallet.key:ro" \
+    -v "$RUN/pulse$number/app-data:/app-data" \
+    -v "$RUN/pulse$number/dashboard-data:/dashboard-data" \
+    -v "$RUN/brclient$number:/app-data/brclientd" \
+    -e DCRD_RPC_HOST=127.0.0.1 -e DCRD_RPC_PORT=19556 -e DCRD_RPC_USER="$RPC_USER" -e DCRD_RPC_PASS="$RPC_PASS" -e DCRD_RPC_CERT=/certs/dcrd.cert \
+    -e DCRWALLET_RPC_HOST=127.0.0.1 -e DCRWALLET_RPC_PORT="$wallet_rpc" -e DCRWALLET_GRPC_PORT="$wallet_grpc" -e DCRWALLET_RPC_USER="$RPC_USER" -e DCRWALLET_RPC_PASS="$RPC_PASS" -e DCRWALLET_RPC_CERT=/certs/wallet.cert \
+    -e BRCLIENTD_HOST=127.0.0.1 -e BRCLIENTD_PORT="$br_rpc" -e BRCLIENTD_STATUS_PORT="$br_status" -e BRCLIENTD_DATA_DIR=/app-data/brclientd \
+    -e PORT="$http" -e GAMING_BRIDGE_HOST=127.0.0.1 -e GAMING_BRIDGE_PORT="$gaming" \
+    -e DCRPULSE_LOG_LEVEL="${PULSE_LOG_LEVEL:-warn}" -e DASHBOARD_HOST_BIND=127.0.0.1 -e MCP_ENABLE=false \
+    "$PULSE_IMAGE" /usr/local/bin/dcrpulse >/dev/null
+}
+start_pulse 1 19557 19558 19760 19761 19680 19690 "$PULSE1"
+start_pulse 2 19567 19568 19770 19771 19681 19691 "$PULSE2"
+wait_http http://127.0.0.1:19680/api/auth/status
+wait_http http://127.0.0.1:19681/api/auth/status
+
+configure_pulse() {
+  local number=$1 http=$2 gaming=$3 headers="$RUN/pulse$number/login-headers"
+  curl -fsS -H "Origin: http://127.0.0.1:$http" -H content-type:application/json \
+    --data "$(jq -nc --arg password "$DASHBOARD_PASS" '{password:$password}')" \
+    "http://127.0.0.1:$http/api/auth/setup" >/dev/null
+  # Setting the password is not the same as holding a session with it. Log in,
+  # take the cookie straight off the response, and send it by hand thereafter.
+  curl -fsS -D "$headers" -H "Origin: http://127.0.0.1:$http" -H content-type:application/json \
+    --data "$(jq -nc --arg password "$DASHBOARD_PASS" '{password:$password}')" \
+    "http://127.0.0.1:$http/api/auth/login" -o /dev/null
+  grep -i '^set-cookie:' "$headers" | sed -e 's/^[Ss]et-[Cc]ookie: *//' -e 's/;.*$//' \
+    | tr -d '\r' | head -1 >"$RUN/pulse$number/session"
+  chmod 600 "$RUN/pulse$number/session"
+  test -s "$RUN/pulse$number/session" || die "pulse $number: the dashboard issued no session cookie"
+  jq -e '.authenticated == true' >/dev/null \
+    <<<"$(curl -sS -H "Cookie: $(session "$number")" "http://127.0.0.1:$http/api/auth/status")" ||
+    die "pulse $number: the dashboard session is not authenticated"
+  # The wallet is deliberately left unloaded (--noinitialload) so this open is
+  # the one dcrwallet answers, and dcrpulse caches the signing capability it
+  # reports. Without it the gaming financial authority refuses every call.
+  # "public" is dcrwallet's default public passphrase - the wallets were created
+  # declining the extra layer of public-data encryption.
+  curl -fsS -H "Cookie: $(session "$number")" -H "Origin: http://127.0.0.1:$http" \
+    -H content-type:application/json --data '{"publicPassphrase":"public"}' \
+    "http://127.0.0.1:$http/api/wallet/open" >/dev/null ||
+    die "pulse $number: dcrpulse could not open the wallet"
+  test -s "$RUN/pulse$number/dashboard-data/wallets/simnet/default-wallet/config.json" ||
+    die "pulse $number: dcrpulse did not record the wallet's signing capability"
+  status=
+  for _ in $(seq 1 480); do
+    status=$(curl -sS -H "Cookie: $(session "$number")" "http://127.0.0.1:$http/api/wallet/status" || true)
+    jq -e '.status == "synced" and .isWatchOnly == false' >/dev/null 2>&1 <<<"$status" && break
+    sleep .25
+  done
+  jq -e '.status == "synced"' >/dev/null 2>&1 <<<"$status" ||
+    die "pulse $number: the wallet never finished syncing: $status"
+  pulse_post "$number" "$http" /br/gaming/settings '{"enabled":true,"registeredGames":["4inarow"],"policies":{"4inarow":{"name":"dcr4inarow","account":"default","perTableCapDcr":1,"perDayCapDcr":10,"approvalTimeoutSecs":600}}}' >/dev/null
+  credential=$(pulse_post "$number" "$http" /br/gaming/credential '{"game":"4inarow"}')
+  jq -n --arg network simnet --arg host 127.0.0.1 --arg port "$gaming" \
+    --arg cert "$(jq -r .certPem <<<"$credential")" --arg key "$(jq -r .keyPem <<<"$credential")" \
+    --arg bridge "$(jq -r .bridgeCertPem <<<"$credential")" \
+    '{network:$network,host:$host,port:$port,client_certificate:$cert,client_private_key:$key,bridge_certificate:$bridge}' >"$RUN/player$number/bridge.json"
+  chmod 600 "$RUN/player$number/bridge.json"
+}
+configure_pulse 1 19680 19690
+configure_pulse 2 19681 19691
+
+run_bg player1 "$BIN/dcr4inarow-simnet-player" -appdata "$RUN/player1" -listen 127.0.0.1:19801
+run_bg player2 "$BIN/dcr4inarow-simnet-player" -appdata "$RUN/player2" -listen 127.0.0.1:19802
+wait_player_jq 19801 '.connected == true' >/dev/null
+wait_player_jq 19802 '.connected == true' >/dev/null
+
+approve_pending() {
+  local number=$1 port=$2 table=$3 kind=$4
+  body=$(wait_pulse_jq "$number" "$port" /br/gaming/spends ".pending | any(.tableId == \"$table\" and .depositKind == \"$kind\")")
+  id=$(jq -r --arg table "$table" --arg kind "$kind" '.pending[] | select(.tableId == $table and .depositKind == $kind) | .id' <<<"$body" | head -1)
+  pulse_post "$number" "$port" /br/gaming/spends/decide "$(jq -nc --arg id "$id" --arg pass "$WALLET_PASS" '{id:$id,approve:true,passphrase:$pass}')" >/dev/null
+}
+
+table_request() {
+  local blocks=$1
+  # Locks match what the game declares: 288 blocks is a day, twice the
+  # longest a match may run.
+  jq -nc --arg gcid "$gcid" --argjson blocks "$blocks" '{game:"4inarow",gcid:$gcid,buyinAtoms:100000,seats:2,openBlocks:$blocks,funds:{refundBlocks:288,admissionAtoms:1000000,admissionBlocks:288,tableBondAtoms:0,tableBondBlocks:0}}'
+}
+
+say "Create an unfilled table for unilateral recovery"
+recovery_table=$(pulse_post 1 19680 /br/gaming/table "$(table_request 4)")
+recovery_sid=$(jq -r .sid <<<"$recovery_table")
+recovery_until=$(jq -r .until <<<"$recovery_table")
+approve_pending 1 19680 "$recovery_sid" seatbond
+mine 1
+height=$(dcrd_result getblockcount | jq -r .)
+if ((height <= recovery_until)); then mine $((recovery_until - height + 1)); fi
+recovery_row=$(wait_pulse_jq --mine 1 19680 /br/gaming/recovery ".deposits | any(.table == \"$recovery_sid\" and .kind == \"seatbond\")")
+recovery_id=$(jq -r --arg table "$recovery_sid" '.deposits[] | select(.table == $table and .kind == "seatbond") | .id' <<<"$recovery_row" | head -1)
+
+say "Create and fund a complete two-player table"
+cooperative_table=$(pulse_post 1 19680 /br/gaming/table "$(table_request 20)")
+cooperative_sid=$(jq -r .sid <<<"$cooperative_table")
+cooperative_until=$(jq -r .until <<<"$cooperative_table")
+cooperative_invite=$(jq -r .invite <<<"$cooperative_table")
+pulse_post 2 19681 /br/gaming/invite "$(jq -nc --arg invite "$cooperative_invite" --arg gcid "$gcid" '{game:"4inarow",invite:$invite,gcid:$gcid}')" >/dev/null
+approve_pending 1 19680 "$cooperative_sid" seatbond
+approve_pending 2 19681 "$cooperative_sid" seatbond
+mine 1
+# Seats are drawn from the block after the admission deadline, so nobody is
+# seated - and no table exists to ask about - until the chain passes it. Give
+# the two joins a moment to be exchanged first: a roster still short when
+# admission shuts is a table that lapses instead of seating.
+sleep 2
+height=$(dcrd_result getblockcount | jq -r .)
+if ((height <= cooperative_until)); then mine $((cooperative_until - height + 1)); fi
+wait_player_jq --mine 19801 ".match == \"$cooperative_sid\" and .canFund == true" >/dev/null
+wait_player_jq --mine 19802 ".match == \"$cooperative_sid\" and .canFund == true" >/dev/null
+curl -fsS -X POST http://127.0.0.1:19801/fund >/dev/null
+curl -fsS -X POST http://127.0.0.1:19802/fund >/dev/null
+approve_pending 1 19680 "$cooperative_sid" stake
+approve_pending 2 19681 "$cooperative_sid" stake
+mine 1
+
+say "Wait for both seats to agree the rules and for every stake to confirm"
+for port in 19801 19802; do
+  wait_player_jq --mine "$port" '.agreed == true' >/dev/null
+done
+for port in 19801 19802; do
+  body=$(wait_player_jq --mine "$port" '.playable == true') || true
+  jq -e '.playable == true' >/dev/null <<<"$body" ||
+    die "player $port is not playable: $(jq -r '.why // "unknown"' <<<"$body")"
+done
+
+say "Play a whole best-of-three, checking both peers agree after every move"
+
+player_status() { curl -fsS "http://127.0.0.1:$1/status"; }
+
+# Every move is played by whichever peer says it is that peer's turn, and both
+# peers must hold the same chain head before the next one. A divergence is the
+# one thing a two-process test exists to catch.
+play_move() {
+  local column=$1 port s1 turn seat h1 h2
+  s1=$(player_status 19801)
+  turn=$(jq -r .turn <<<"$s1"); seat=$(jq -r .seat <<<"$s1")
+  if [[ $turn == "$seat" ]]; then port=19801; else port=19802; fi
+  curl -fsS -X POST -H content-type:application/json \
+    --data "$(jq -nc --argjson column "$column" '{column:$column}')" \
+    "http://127.0.0.1:$port/move" >/dev/null
+  for _ in $(seq 1 240); do
+    h1=$(player_status 19801 | jq -r '.head // ""')
+    h2=$(player_status 19802 | jq -r '.head // ""')
+    if test -n "$h1" && test "$h1" = "$h2"; then return 0; fi
+    sleep .25
+  done
+  die "peers diverged after a move into column $column: $h1 vs $h2"
+}
+
+# A vertical win for whoever opens each board. Seat 0 opens boards one and
+# three, so it takes the match two boards to one.
+for board in 1 2 3; do
+  say "Board $board"
+  for column in 0 1 0 1 0 1 0; do play_move "$column"; done
+done
+
+wait_player_jq 19801 '.done == true' >/dev/null
+wait_player_jq 19802 '.done == true' >/dev/null
+s1=$(player_status 19801); s2=$(player_status 19802)
+jq -e '.won == true and .winner == 0' >/dev/null <<<"$s1" || die "peer one did not see seat 0 win: $s1"
+jq -e '.won == true and .winner == 0' >/dev/null <<<"$s2" || die "peer two did not see seat 0 win: $s2"
+test "$(jq -r .moves <<<"$s1")" = 21 || die "a best-of-three of vertical wins is 21 moves"
+test "$(jq -r .head <<<"$s1")" = "$(jq -r .head <<<"$s2")" || die "peers hold different histories"
+
+say "Both seats verify the result and propose the payout"
+curl -fsS -X POST http://127.0.0.1:19801/settle >/dev/null
+curl -fsS -X POST http://127.0.0.1:19802/settle >/dev/null
+
+say "Approve the exact cooperative payout on both bridges"
+p1=$(wait_pulse_jq 1 19680 /br/gaming/payouts ".payouts | any(.table == \"$cooperative_sid\")")
+p2=$(wait_pulse_jq 2 19681 /br/gaming/payouts ".payouts | any(.table == \"$cooperative_sid\")")
+payout1=$(jq -r --arg table "$cooperative_sid" '.payouts[] | select(.table == $table) | .id' <<<"$p1" | head -1)
+payout2=$(jq -r --arg table "$cooperative_sid" '.payouts[] | select(.table == $table) | .id' <<<"$p2" | head -1)
+test "$payout1" = "$payout2" || die "bridges derived different payout IDs"
+pulse_post 1 19680 /br/gaming/payouts "$(jq -nc --arg id "$payout1" --arg pass "$WALLET_PASS" '{id:$id,action:"approve",passphrase:$pass}')" >/dev/null
+pulse_post 2 19681 /br/gaming/payouts "$(jq -nc --arg id "$payout2" --arg pass "$WALLET_PASS" '{id:$id,action:"approve",passphrase:$pass}')" >/dev/null
+for _ in $(seq 1 360); do
+  mempool=$(dcrd_result getrawmempool 2>/dev/null || echo '[]')
+  test "$(jq length <<<"$mempool")" -gt 0 && break
+  sleep .5
+done
+test "$(jq length <<<"$mempool")" -gt 0 || die "cooperative payout was not broadcast"
+mine 1
+wait_pulse_jq --mine 1 19680 /br/gaming/payouts ".payouts | any(.id == \"$payout1\" and .state == \"confirmed\")" >/dev/null
+wait_pulse_jq --mine 2 19681 /br/gaming/payouts ".payouts | any(.id == \"$payout2\" and .state == \"confirmed\")" >/dev/null
+
+say "Both seats see their own stake spent"
+# The SDK's Settled hook never fires, so a game learns its payout by watching
+# its own stake become spent. Assert the game learned it, not just the bridge.
+for port in 19801 19802; do
+  wait_player_jq --mine "$port" '.paid == true' >/dev/null
+done
+
+say "Mature and recover the abandoned admission bond"
+pulse_post 1 19680 /br/gaming/recovery "$(jq -nc --arg id "$recovery_id" '{id:$id,action:"close"}')" >/dev/null
+row=$(pulse_get 1 19680 /br/gaming/recovery)
+remaining=$(jq -r --arg id "$recovery_id" '.deposits[] | select(.id == $id) | .remainingBlocks' <<<"$row")
+if ((remaining > 0)); then mine $((remaining + 1)); fi
+row=$(wait_pulse_jq --mine 1 19680 /br/gaming/recovery ".deposits | any(.id == \"$recovery_id\" and .canRecover == true)")
+quote=$(pulse_post 1 19680 /br/gaming/recovery "$(jq -nc --arg id "$recovery_id" '{id:$id,action:"quote"}')")
+quote_id=$(jq -r .id <<<"$quote")
+result=$(pulse_post 1 19680 /br/gaming/recovery "$(jq -nc --arg id "$recovery_id" --arg quote "$quote_id" --arg pass "$WALLET_PASS" '{id:$id,quote:$quote,passphrase:$pass,action:"confirm"}')")
+jq -e '.pending == true and (.txid | length == 64)' >/dev/null <<<"$result" || die "recovery was not broadcast"
+mine 1
+wait_pulse_jq --mine 1 19680 /br/gaming/recovery ".deposits | any(.id == \"$recovery_id\" and .state == \"spent\")" >/dev/null
+
+say "PASS: two wallets, two bridges, 21 signed moves with identical heads, cooperative payout, mature unilateral recovery"
