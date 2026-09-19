@@ -179,6 +179,12 @@ type table struct {
 	abandoned bool
 	stalled   uint32
 	expired   bool
+	// staked latches once every seat's stake has been seen confirmed on
+	// chain. It does not un-latch: a later check that could not reach the
+	// chain reports "unavailable", which means this peer could not ask, not
+	// that the money left escrow. Treating the two the same stops a match
+	// mid-play over one unanswered call.
+	staked bool
 	// phase is the runtime's lifecycle word for this table, and verified
 	// says this peer has checked the roster's admission bonds on chain.
 	phase    string
@@ -941,16 +947,6 @@ func (g *Game) Settle(ctx context.Context, sid string) error {
 	return nil
 }
 
-// Settled is called when a payout has been broadcast, which is when the money
-// is decided.
-func (g *Game) Settled(_ context.Context, sid string, _ string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if t, ok := g.tables[sid]; ok {
-		t.settled = true
-	}
-}
-
 // Tables are the sessions this game has open, newest state included. The
 // client asks rather than being told, because a table can arrive while no
 // screen is looking at it.
@@ -1027,6 +1023,7 @@ func (g *Game) Prepare(ctx context.Context, sid string) error {
 	}
 	g.mu.Lock()
 	t.snap = refreshed
+	t.staked = stakesConfirmed(refreshed, int(rt.Terms(sid).Seats), t.staked)
 	g.mu.Unlock()
 	g.notePayout(t, refreshed)
 	g.freeze(sid)
@@ -1281,3 +1278,36 @@ func (g *Game) Ready(sid string) bool {
 // chain is asked to sign one. Called with the game's lock held.
 func head(t *table) [32]byte { h, _ := t.chain.Head(); return h }
 func next(t *table) uint64   { _, seq := t.chain.Head(); return seq }
+
+// stakesConfirmed reports whether every seat's stake is confirmed on chain,
+// given what was true before.
+//
+// A stake that reads "unavailable" is one this peer could not ask about, which
+// is not the same as one that is gone: the chain lookup behind it fails on any
+// transient, and a table that stopped being playable every time a call went
+// unanswered would abandon matches over nothing. So that answer keeps whatever
+// was already known. Every other answer is an answer, and counts.
+func stakesConfirmed(snap sdk.TableSnapshot, seats int, was bool) bool {
+	if seats <= 0 {
+		return false
+	}
+	confirmed, unknown := 0, false
+	for _, d := range snap.Deposits {
+		if d.Purpose != tablelobby.PurposeStake {
+			continue
+		}
+		switch d.Check {
+		case tablelobby.CheckVerified:
+			confirmed++
+		case tablelobby.CheckUnavailable:
+			unknown = true
+		}
+	}
+	if confirmed == seats {
+		return true
+	}
+	if unknown {
+		return was
+	}
+	return false
+}

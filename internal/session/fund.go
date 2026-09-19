@@ -123,7 +123,7 @@ func (g *Game) Playable(sid string) (bool, string) {
 		return false, "no table"
 	}
 	g.mu.Lock()
-	snap, seen, verified := t.snap, t.seen, t.verified
+	snap, seen, verified, staked := t.snap, t.seen, t.verified, t.staked
 	g.mu.Unlock()
 	if !seen {
 		return false, "the table has not been checked yet"
@@ -138,14 +138,14 @@ func (g *Game) Playable(sid string) (bool, string) {
 		return false, "waiting for both seats to state the same rules"
 	}
 	seats := int(rt.Terms(sid).Seats)
-	staked := 0
-	for _, d := range snap.Deposits {
-		if d.Purpose == tablelobby.PurposeStake && d.Check == tablelobby.CheckVerified {
-			staked++
+	if !staked {
+		confirmed := 0
+		for _, d := range snap.Deposits {
+			if d.Purpose == tablelobby.PurposeStake && d.Check == tablelobby.CheckVerified {
+				confirmed++
+			}
 		}
-	}
-	if staked != seats {
-		return false, fmt.Sprintf("%d of %d stakes confirmed", staked, seats)
+		return false, fmt.Sprintf("%d of %d stakes confirmed", confirmed, seats)
 	}
 	if len(snap.Record.Payouts) != seats {
 		return false, "waiting for both payout destinations"

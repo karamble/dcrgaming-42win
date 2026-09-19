@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"path/filepath"
-
 	"github.com/decred/dcrd/chaincfg/v3"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
 	"github.com/decred/slog"
@@ -18,7 +16,6 @@ import (
 	"github.com/karamble/dcrgaming-sdk/pkg/gaming/transport"
 	"github.com/karamble/dcrgaming-sdk/pkg/identity"
 	sdk "github.com/karamble/dcrgaming-sdk/pkg/runtime"
-	"github.com/karamble/dcrgaming-sdk/pkg/spend"
 )
 
 // testLog is off unless a probing test turns it on.
@@ -86,37 +83,20 @@ func openPeer(t *testing.T, p *peer) {
 		cancel()
 		t.Fatalf("%s dial: %v", p.name, err)
 	}
-	store, err := spend.FileStore(filepath.Join(p.dir, "spends.json"))
-	if err != nil {
-		cancel()
-		t.Fatalf("%s spend store: %v", p.name, err)
-	}
-	book, err := spend.OpenBook(store)
-	if err != nil {
-		cancel()
-		t.Fatalf("%s spend book: %v", p.name, err)
-	}
-	tables, err := sdk.NewFileTableStore(filepath.Join(p.dir, "tables"))
-	if err != nil {
-		cancel()
-		t.Fatalf("%s table store: %v", p.name, err)
-	}
 	seed, err := identity.Load(p.dir)
 	if err != nil {
 		cancel()
 		t.Fatalf("%s identity: %v", p.name, err)
 	}
-	rt, err := sdk.New(sdk.Config{
-		Rules: g, Bridge: conn, Book: book, Identity: seed,
-		SeatTags: session.SeatTags, Params: p.params, Tables: tables, Log: testLog,
+	// Params explicitly: the fake bridge has not said hello. TickEvery is off
+	// because this test drives the height itself.
+	rt, err := sdk.Open(sdk.Config{
+		Rules: g, Bridge: conn, Identity: seed, Dir: p.dir,
+		SeatTags: session.SeatTags, Params: p.params, TickEvery: -1, Log: testLog,
 	})
 	if err != nil {
 		cancel()
 		t.Fatalf("%s runtime: %v", p.name, err)
-	}
-	if _, err := rt.ResumeWithReport(); err != nil {
-		cancel()
-		t.Fatalf("%s resume: %v", p.name, err)
 	}
 	g.Bind(rt)
 	done := make(chan struct{})

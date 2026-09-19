@@ -18,13 +18,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/decred/dcrd/chaincfg/v3"
-	"github.com/decred/dcrd/txscript/v4/stdaddr"
 	"github.com/karamble/dcr4inarow/internal/bridgeconn"
 	"github.com/karamble/dcr4inarow/internal/session"
 	"github.com/karamble/dcrgaming-sdk/pkg/identity"
 	sdk "github.com/karamble/dcrgaming-sdk/pkg/runtime"
-	"github.com/karamble/dcrgaming-sdk/pkg/spend"
 )
 
 type player struct {
@@ -107,30 +104,16 @@ func (p *player) start(dir string, cfg bridgeconn.Config) error {
 	if err != nil {
 		return err
 	}
-	store, err := spend.FileStore(filepath.Join(dir, "spends.json"))
-	if err != nil {
-		return err
-	}
-	book, err := spend.OpenBook(store)
-	if err != nil {
-		return err
-	}
-	tables, err := sdk.NewFileTableStore(filepath.Join(dir, "tables"))
-	if err != nil {
-		return err
-	}
 	seed, err := identity.Load(dir)
 	if err != nil {
 		return err
 	}
-	rt, err := sdk.New(sdk.Config{
-		Rules: game, Bridge: bridge, Book: book, Identity: seed,
-		SeatTags: session.SeatTags, Params: params(cfg.Network), Tables: tables,
+	// The harness mines on demand, so follow the tip closely.
+	rt, err := sdk.Open(sdk.Config{
+		Rules: game, Bridge: bridge, Identity: seed, Dir: dir,
+		SeatTags: session.SeatTags, TickEvery: time.Second,
 	})
 	if err != nil {
-		return err
-	}
-	if _, err := rt.ResumeWithReport(); err != nil {
 		return err
 	}
 	game.Bind(rt)
@@ -152,7 +135,6 @@ func (p *player) follow(ctx context.Context) {
 	defer t.Stop()
 	for range t.C {
 		if tip, err := p.rt.Chain(ctx); err == nil {
-			p.rt.Tick(ctx, tip.Height)
 			p.mu.Lock()
 			p.height = tip.Height
 			p.mu.Unlock()
@@ -208,8 +190,11 @@ func (p *player) status(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, out)
 }
 
+// fund starts the payment and answers. Fund blocks until a person approves in
+// dcrpulse, and the approval is the next thing the harness does, so answering
+// only after it returned would deadlock the two against each other.
 func (p *player) fund(w http.ResponseWriter, r *http.Request) {
-	p.act(w, func(sid string) error { return p.game.Fund(r.Context(), sid) })
+	p.queue(w, func(sid string) error { return p.game.Fund(context.Background(), sid) })
 }
 
 func (p *player) settle(w http.ResponseWriter, r *http.Request) {
@@ -229,6 +214,27 @@ func (p *player) move(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.act(w, func(sid string) error { return p.game.Play(r.Context(), sid, body.Column) })
+}
+
+// queue runs an action that waits on a person, and answers straight away. Its
+// outcome shows up in the status report rather than in this response.
+func (p *player) queue(w http.ResponseWriter, do func(string) error) {
+	sid, ok := p.table()
+	if !ok {
+		http.Error(w, "no table", http.StatusConflict)
+		return
+	}
+	go func() {
+		err := do(sid)
+		p.mu.Lock()
+		if err != nil {
+			p.lastErr = err.Error()
+		} else {
+			p.lastErr = ""
+		}
+		p.mu.Unlock()
+	}()
+	writeJSON(w, map[string]bool{"queued": true})
 }
 
 func (p *player) act(w http.ResponseWriter, do func(string) error) {
@@ -253,15 +259,4 @@ func (p *player) act(w http.ResponseWriter, do func(string) error) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func params(network string) stdaddr.AddressParams {
-	switch network {
-	case "testnet3":
-		return chaincfg.TestNet3Params()
-	case "simnet":
-		return chaincfg.SimNetParams()
-	default:
-		return chaincfg.MainNetParams()
-	}
 }

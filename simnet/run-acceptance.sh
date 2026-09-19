@@ -25,6 +25,12 @@ WALLET_PASS=123
 # What the second wallet needs: a buy-in and an admission bond are together far
 # under a coin, so this is generous rather than calculated.
 WALLET2_FUNDING=5
+# The voting wallet buys the ticket pool. Tickets start at 0.0002 DCR on simnet
+# and the stake returns when a ticket votes, so this is float, not spend.
+VOTER_FUNDING=40
+# Simnet requires five votes per block from this height on: chaincfg's
+# StakeValidationHeight, CoinbaseMaturity + TicketPoolSize*2.
+STAKE_VALIDATION_HEIGHT=144
 DASHBOARD_PASS=dcr4inarow-simnet-dashboard-password
 PULSE_IMAGE=${PULSE_IMAGE:-alpine:3.22}
 PULSE1=d4-simnet-pulse1-$$
@@ -118,7 +124,37 @@ dcrd_result() {
   }
 }
 
-mine() { dcrd_result generate "[$1]" >/dev/null; }
+# mine mints blocks.
+#
+# Below the stake validation height a block needs nothing but proof of work, so
+# they are minted in one call. From that height on every block must carry five
+# votes from live tickets, and dcrd will not build a template without them - it
+# waits, silently and forever. So past that point blocks are minted one at a
+# time, each with a breath for the voting wallet to see the new tip and cast.
+mine() {
+  local want=$1 height i
+  height=$(dcrd_result getblockcount | jq -r .) || return 1
+  if ((height + want < STAKE_VALIDATION_HEIGHT - 1)); then
+    dcrd_result generate "[$want]" >/dev/null
+    return
+  fi
+  for ((i = 0; i < want; i++)); do
+    dcrd_result generate "[1]" >/dev/null ||
+      die "the chain stopped at $(dcrd_result getblockcount | jq -r .); the ticket pool is probably empty"
+    sleep "${VOTE_PAUSE:-0.25}"
+  done
+}
+
+# tickets keeps the voting wallet's pool stocked. Tickets mature 16 blocks after
+# purchase and each block from the validation height on spends five of them, so
+# the pool has to be deep and live before the chain gets there.
+buy_tickets() {
+  local want=$1 got
+  wallet_result 0 19537 purchaseticket \
+    "$(jq -nc --argjson n "$want" '["default",1000,1,null,$n]')" >/dev/null 2>&1 || true
+  got=$(wallet_result 0 19537 getstakeinfo 2>/dev/null | jq -r '.immature + .live' 2>/dev/null || echo 0)
+  printf '%s' "${got:-0}"
+}
 
 wallet_result() {
   local number=$1 port=$2 method=$3 params=${4:-'[]'} body
@@ -258,7 +294,7 @@ EOF
 # nothing about the cause.
 ports_free() {
   local busy=""
-  for port in 19555 19556 19443 19557 19567 19680 19681 19690 19691 19801 19802; do
+  for port in 19555 19556 19443 19537 19557 19567 19680 19681 19690 19691 19801 19802; do
     if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port "; then busy="$busy $port"; fi
   done
   if test -n "$busy"; then
@@ -274,6 +310,33 @@ run_bg brserver "$BIN/brserver" -cfg "$RUN/brserver.conf"
 wait_file "$RUN/dcrd/rpc.cert"
 for _ in $(seq 1 120); do dcrd_rpc getblockcount && break; sleep .25; done
 mine 2
+
+# Wallet 0 is not a player. It holds the ticket pool and casts the votes that
+# make blocks valid past the stake validation height, which is what lets this
+# chain reach a 288-block timelock at all. It is kept away from the two player
+# wallets because dcrpulse loads and locks those, and a locked wallet cannot
+# vote.
+cat >"$RUN/wallet0.conf" <<EOF
+[Application Options]
+simnet=1
+appdata=$RUN/wallet0
+logdir=$RUN/wallet0/logs
+pass=$WALLET_PASS
+rpcconnect=127.0.0.1:19556
+cafile=$RUN/dcrd/rpc.cert
+rpclisten=127.0.0.1:19537
+grpclisten=127.0.0.1:19538
+rpccert=$RUN/wallet0/rpc.cert
+rpckey=$RUN/wallet0/rpc.key
+clientcafile=$RUN/wallet0/rpc.cert
+username=$RPC_USER
+password=$RPC_PASS
+enablevoting=1
+enableticketbuyer=1
+ticketbuyer.limit=20
+ticketbuyer.balancetomaintainabsolute=1
+debuglevel=warn
+EOF
 
 for number in 1 2; do
   port=$((19547 + number * 10))
@@ -300,11 +363,18 @@ done
 # Public simnet fixture seeds. Never use these wallets on another network.
 printf 'y\nn\ny\nb280922d2cffda44648346412c5ec97f429938105003730414f10b01e1402eac\n\n\n' | "$BIN/dcrwallet" -C "$RUN/wallet1.conf" --create >/dev/null
 printf 'y\nn\ny\n4242424242424242424242424242424242424242424242424242424242424242\n\n\n' | "$BIN/dcrwallet" -C "$RUN/wallet2.conf" --create >/dev/null
+printf 'y\nn\ny\n7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f\n\n\n' | "$BIN/dcrwallet" -C "$RUN/wallet0.conf" --create >/dev/null
+run_bg wallet0 "$BIN/dcrwallet" -C "$RUN/wallet0.conf"
 run_bg wallet1 "$BIN/dcrwallet" -C "$RUN/wallet1.conf"
 wallet1_pid=${PIDS[-1]}
 run_bg wallet2 "$BIN/dcrwallet" -C "$RUN/wallet2.conf"
 wallet2_pid=${PIDS[-1]}
-for _ in $(seq 1 240); do wallet_result 1 19557 getbalance >/dev/null 2>&1 && wallet_result 2 19567 getbalance >/dev/null 2>&1 && break; sleep .25; done
+for _ in $(seq 1 240); do
+  wallet_result 0 19537 getbalance >/dev/null 2>&1 &&
+    wallet_result 1 19557 getbalance >/dev/null 2>&1 &&
+    wallet_result 2 19567 getbalance >/dev/null 2>&1 && break
+  sleep .25
+done
 mine 32
 # Mine until the coin is actually spendable rather than a fixed number of
 # blocks and a hope. A coinbase is immature for its first sixteen blocks, and
@@ -313,15 +383,38 @@ mine 32
 balance=0
 for _ in $(seq 1 60); do
   balance=$(wallet_result 1 19557 getbalance 2>/dev/null | jq -r '.totalspendable // (.balances[0].spendable // 0)' || echo 0)
-  awk "BEGIN {exit !($balance > $WALLET2_FUNDING)}" && break
+  awk "BEGIN {exit !($balance > $WALLET2_FUNDING + $VOTER_FUNDING)}" && break
   mine 4
   sleep .5
 done
-awk "BEGIN {exit !($balance > $WALLET2_FUNDING)}" ||
+awk "BEGIN {exit !($balance > $WALLET2_FUNDING + $VOTER_FUNDING)}" ||
   die "wallet 1 never had spendable coin (last balance $balance): $(wallet_result 1 19557 getbalance 2>&1 || true)"
 wallet2_address=$(wallet_result 2 19567 getnewaddress | jq -r .)
 wallet_result 1 19557 sendtoaddress "$(jq -nc --arg address "$wallet2_address" --argjson amount "$WALLET2_FUNDING" '[$address,$amount]')" >/dev/null
+voter_address=$(wallet_result 0 19537 getnewaddress | jq -r .)
+wallet_result 1 19557 sendtoaddress "$(jq -nc --arg address "$voter_address" --argjson amount "$VOTER_FUNDING" '[$address,$amount]')" >/dev/null
 mine 2
+
+# Stock the ticket pool while the chain is still below the validation height.
+# Every block from there on spends five tickets, and a ticket is only live
+# sixteen blocks after it is bought, so the pool has to be built now or the
+# chain cannot advance later - which is what a 288-block timelock needs it to.
+say "Stock the ticket pool for proof-of-stake voting"
+live=0
+for _ in $(seq 1 12); do
+  buy_tickets 20 >/dev/null
+  mine 1
+  live=$(wallet_result 0 19537 getstakeinfo 2>/dev/null | jq -r '(.immature // 0) + (.live // 0)' 2>/dev/null || echo 0)
+  ((live >= 60)) && break
+done
+((live > 0)) || die "the voting wallet bought no tickets: $(wallet_result 0 19537 getstakeinfo 2>&1 | head -c 300)"
+# Let them mature into live, voteable tickets.
+for _ in $(seq 1 10); do
+  mine 4
+  ready=$(wallet_result 0 19537 getstakeinfo 2>/dev/null | jq -r '.live // 0')
+  ((ready >= 20)) && break
+done
+((ready >= 5)) || die "only $ready tickets went live; five are needed for every block past height $STAKE_VALIDATION_HEIGHT"
 
 # dcrpulse learns whether a wallet can sign from dcrwallet's OpenWalletResponse
 # and caches that answer per wallet. When the wallet is already loaded its open
@@ -480,12 +573,17 @@ approve_pending 1 19680 "$cooperative_sid" seatbond
 approve_pending 2 19681 "$cooperative_sid" seatbond
 mine 1
 # Seats are drawn from the block after the admission deadline, so nobody is
-# seated - and no table exists to ask about - until the chain passes it. Give
-# the two joins a moment to be exchanged first: a roster still short when
-# admission shuts is a table that lapses instead of seating.
-sleep 2
+# seated - and no table exists to ask about - until the chain passes it.
+#
+# Hold the chain one block below the deadline while the two joins are exchanged
+# over Bison Relay. A roster still short when admission shuts is a table that
+# aborts with "only 1 of 2 seats were taken before the deadline", and once that
+# has happened no amount of later mining recovers it.
 height=$(dcrd_result getblockcount | jq -r .)
-if ((height <= cooperative_until)); then mine $((cooperative_until - height + 1)); fi
+if ((height < cooperative_until)); then mine $((cooperative_until - height)); fi
+sleep "${JOIN_SETTLE_SECONDS:-10}"
+# Now cross it, which draws the seats.
+mine 1
 wait_player_jq --mine 19801 ".match == \"$cooperative_sid\" and .canFund == true" >/dev/null
 wait_player_jq --mine 19802 ".match == \"$cooperative_sid\" and .canFund == true" >/dev/null
 curl -fsS -X POST http://127.0.0.1:19801/fund >/dev/null

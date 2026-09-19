@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/decred/dcrd/chaincfg/v3"
-	"github.com/decred/dcrd/txscript/v4/stdaddr"
 	"github.com/decred/slog"
 	"github.com/karamble/dcr4inarow/assets/art"
 	"github.com/karamble/dcr4inarow/internal/appconfig"
@@ -23,7 +21,6 @@ import (
 	"github.com/karamble/dcr4inarow/pkg/render"
 	"github.com/karamble/dcrgaming-sdk/pkg/identity"
 	sdk "github.com/karamble/dcrgaming-sdk/pkg/runtime"
-	"github.com/karamble/dcrgaming-sdk/pkg/spend"
 )
 
 type screen int
@@ -328,45 +325,23 @@ func (a *app) start(cfg bridgeconn.Config) error {
 		cancel()
 		return err
 	}
-	store, err := spend.FileStore(filepath.Join(a.dir, "spends.json"))
-	if err != nil {
-		cancel()
-		bridge.Close()
-		return fmt.Errorf("could not open the payment record: %w", err)
-	}
-	book, err := spend.OpenBook(store)
-	if err != nil {
-		cancel()
-		bridge.Close()
-		return fmt.Errorf("could not open the payment record: %w", err)
-	}
-	tables, err := sdk.NewFileTableStore(filepath.Join(a.dir, "tables"))
-	if err != nil {
-		cancel()
-		bridge.Close()
-		return fmt.Errorf("could not open the table record: %w", err)
-	}
 	seed, err := identity.Load(a.dir)
 	if err != nil {
 		cancel()
 		bridge.Close()
 		return fmt.Errorf("could not open this profile's identity: %w", err)
 	}
-	rt, err := sdk.New(sdk.Config{
-		Rules: game, Bridge: bridge, Book: book, Identity: seed,
-		SeatTags: session.SeatTags, Params: params(cfg.Network), Tables: tables,
-		Log: a.sdkLog,
+	// The runtime keeps its own records under the profile directory and takes
+	// the chain from the bridge, which said which one it was on when it said
+	// hello.
+	rt, err := sdk.Open(sdk.Config{
+		Rules: game, Bridge: bridge, Identity: seed, Dir: a.dir,
+		SeatTags: session.SeatTags, Log: a.sdkLog,
 	})
 	if err != nil {
 		cancel()
 		bridge.Close()
 		return err
-	}
-	if _, err := rt.ResumeWithReport(); err != nil {
-		cancel()
-		rt.Close()
-		bridge.Close()
-		return fmt.Errorf("could not resume saved tables: %w", err)
 	}
 	game.Bind(rt)
 
@@ -386,7 +361,6 @@ func (a *app) follow(ctx context.Context, rt *sdk.Runtime) {
 	defer t.Stop()
 	for {
 		if tip, err := rt.Chain(ctx); err == nil {
-			rt.Tick(ctx, tip.Height)
 			a.mu.Lock()
 			a.height = uint32(tip.Height)
 			a.mu.Unlock()
@@ -429,22 +403,6 @@ func (a *app) adopt() {
 		a.sid = open
 		a.mu.Unlock()
 		return
-	}
-}
-
-// params is the chain the bridge said it is on.
-//
-// Chosen from the authenticated network rather than compiled in: the scripts
-// and addresses a table builds depend on it, and a game that assumed mainnet
-// would build unspendable ones everywhere else.
-func params(network string) stdaddr.AddressParams {
-	switch network {
-	case "testnet3":
-		return chaincfg.TestNet3Params()
-	case "simnet":
-		return chaincfg.SimNetParams()
-	default:
-		return chaincfg.MainNetParams()
 	}
 }
 
