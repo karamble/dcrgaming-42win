@@ -653,12 +653,17 @@ payout2=$(jq -r --arg table "$cooperative_sid" '.payouts[] | select(.table == $t
 test "$payout1" = "$payout2" || die "bridges derived different payout IDs"
 pulse_post 1 19680 /br/gaming/payouts "$(jq -nc --arg id "$payout1" --arg pass "$WALLET_PASS" '{id:$id,action:"approve",passphrase:$pass}')" >/dev/null
 pulse_post 2 19681 /br/gaming/payouts "$(jq -nc --arg id "$payout2" --arg pass "$WALLET_PASS" '{id:$id,action:"approve",passphrase:$pass}')" >/dev/null
+# Wait for this payout, by id, not for a mempool that merely has something in
+# it: the voting wallet's ticket buyer keeps its own transactions there, so a
+# non-empty mempool proves nothing. The payout's id is its transaction hash.
+seen=false
 for _ in $(seq 1 360); do
   mempool=$(dcrd_result getrawmempool 2>/dev/null || echo '[]')
-  test "$(jq length <<<"$mempool")" -gt 0 && break
+  seen=$(jq -r --arg id "$payout1" 'any(.[]?; . == $id)' <<<"$mempool" 2>/dev/null || echo false)
+  [[ $seen == true ]] && break
   sleep .5
 done
-test "$(jq length <<<"$mempool")" -gt 0 || die "cooperative payout was not broadcast"
+[[ $seen == true ]] || die "cooperative payout $payout1 was not broadcast"
 mine 1
 wait_pulse_jq --mine 1 19680 /br/gaming/payouts ".payouts | any(.id == \"$payout1\" and .state == \"confirmed\")" >/dev/null
 wait_pulse_jq --mine 2 19681 /br/gaming/payouts ".payouts | any(.id == \"$payout2\" and .state == \"confirmed\")" >/dev/null
