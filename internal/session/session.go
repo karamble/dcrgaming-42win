@@ -20,13 +20,13 @@ import (
 	"sync"
 
 	"github.com/decred/slog"
-	"github.com/karamble/dcr4inarow/internal/audit"
-	"github.com/karamble/dcr4inarow/internal/board"
-	"github.com/karamble/dcr4inarow/internal/manifest"
-	"github.com/karamble/dcr4inarow/internal/match"
-	"github.com/karamble/dcr4inarow/internal/movelog"
-	"github.com/karamble/dcr4inarow/internal/payout"
-	"github.com/karamble/dcr4inarow/internal/tablelobby"
+	"github.com/karamble/dcrgaming-42win/internal/audit"
+	"github.com/karamble/dcrgaming-42win/internal/board"
+	"github.com/karamble/dcrgaming-42win/internal/manifest"
+	"github.com/karamble/dcrgaming-42win/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/movelog"
+	"github.com/karamble/dcrgaming-42win/internal/payout"
+	"github.com/karamble/dcrgaming-42win/internal/tablelobby"
 	"github.com/karamble/dcrgaming-sdk/pkg/forfeit"
 	"github.com/karamble/dcrgaming-sdk/pkg/gaming/connect"
 	"github.com/karamble/dcrgaming-sdk/pkg/gaming/gamingpb"
@@ -176,9 +176,10 @@ type table struct {
 	settled bool
 	// abandoned records that one seat gave up on the other, and which seat
 	// was said to have stopped.
-	abandoned bool
-	stalled   uint32
-	expired   bool
+	abandoned       bool
+	abandonEvidence *movelog.Abandon
+	stalled         uint32
+	expired         bool
 	// staked latches once every seat's stake has been seen confirmed on
 	// chain. It does not un-latch: a later check that could not reach the
 	// chain reports "unavailable", which means this peer could not ask, not
@@ -376,6 +377,7 @@ func (g *Game) open(sid string) error {
 		pending: rep.Pending,
 	}
 	if a := rep.Abandon; a != nil {
+		t.abandonEvidence = a
 		t.abandoned, t.stalled, t.expired = true, a.Stalled, a.Reason == movelog.ReasonExpired
 	}
 	for _, note := range rep.Notes {
@@ -543,6 +545,7 @@ func (g *Game) adjudicate(t *table, height uint32) {
 		return
 	}
 	t.abandoned, t.stalled, t.expired = true, a.Stalled, a.Reason == movelog.ReasonExpired
+	t.abandonEvidence = a
 	t.pendingAbandon = nil
 	log.Infof("table %s: seat %d gave up on the match at block %d (%s)",
 		t.chain.MatchID(), a.Seat, a.Deadline, a.Reason)
@@ -636,6 +639,7 @@ func (g *Game) Abandon(ctx context.Context, sid string) error {
 		return err
 	}
 	t.abandoned, t.stalled, t.expired = true, stalled, reason == movelog.ReasonExpired
+	t.abandonEvidence = a
 	g.mu.Unlock()
 
 	return rt.Send(ctx, sid, KindAbandon, a, wire.ClassDurable)
@@ -769,6 +773,10 @@ func (g *Game) State(_ context.Context) sdk.State {
 
 // View is a detached snapshot of one table, for a screen to draw.
 type View struct {
+	Entries               []movelog.Entry
+	Results               []match.Result
+	BuyIn, Bond           int64
+	StakeCheck, BondCheck string
 	// Grid is a copy of the board being played. A value, so a screen can
 	// never read a square while a move is being applied to it.
 	Grid    board.Board
@@ -816,12 +824,25 @@ func (g *Game) View(sid string) (View, bool) {
 	}
 	winner, won, done := t.play.Outcome()
 	v := View{
+		Entries: t.chain.Entries(), Results: t.play.Results(),
+		BuyIn: int64(t.snap.Record.Terms.BuyInAtoms), Bond: int64(t.snap.Record.Terms.BondAtoms),
 		Grid: *t.play.Board(),
 		Seat: t.seat, Board: t.play.Index(), Turn: t.play.Turn(),
 		Score: t.play.Score(), Done: done, Winner: winner, Won: won,
 		Moves: t.chain.Len(), MatchID: t.chain.MatchID(), Head: headHex(t.chain),
 		Abandoned: t.abandoned, Stalled: t.stalled, Expired: t.expired,
 		Phase: t.phase, Verified: t.verified, Paid: t.paid, Blocked: t.blocked,
+	}
+	for _, d := range t.snap.Deposits {
+		if d.Seat != t.seat {
+			continue
+		}
+		if d.Purpose == tablelobby.PurposeStake {
+			v.StakeCheck = d.Check
+		}
+		if d.Purpose == tablelobby.PurposeSeatBond {
+			v.BondCheck = d.Check
+		}
 	}
 	if last, ok := t.chain.LastHeight(); ok {
 		v.Deadline = last + MoveDeadlineBlocks

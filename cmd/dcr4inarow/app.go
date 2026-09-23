@@ -12,13 +12,14 @@ import (
 	"time"
 
 	"github.com/decred/slog"
-	"github.com/karamble/dcr4inarow/assets/art"
-	"github.com/karamble/dcr4inarow/internal/appconfig"
-	"github.com/karamble/dcr4inarow/internal/bridgeconn"
-	"github.com/karamble/dcr4inarow/internal/clipboard"
-	"github.com/karamble/dcr4inarow/internal/session"
-	"github.com/karamble/dcr4inarow/internal/tablelobby"
-	"github.com/karamble/dcr4inarow/pkg/render"
+	"github.com/karamble/dcrgaming-42win/assets/art"
+	"github.com/karamble/dcrgaming-42win/internal/appconfig"
+	"github.com/karamble/dcrgaming-42win/internal/bridgeconn"
+	"github.com/karamble/dcrgaming-42win/internal/clipboard"
+	"github.com/karamble/dcrgaming-42win/internal/session"
+	"github.com/karamble/dcrgaming-42win/internal/tablelobby"
+	"github.com/karamble/dcrgaming-42win/internal/uiprefs"
+	"github.com/karamble/dcrgaming-42win/pkg/render"
 	"github.com/karamble/dcrgaming-sdk/pkg/identity"
 	sdk "github.com/karamble/dcrgaming-sdk/pkg/runtime"
 )
@@ -32,6 +33,8 @@ const (
 	// the table is waiting for.
 	screenSeating
 	screenTable
+	screenHelp
+	screenReceipt
 )
 
 // Field indices, in the order the settings screen draws them.
@@ -50,9 +53,22 @@ const (
 // dialling a bridge, waiting for a block - happens off the draw loop. A frame
 // that blocked on a network call would freeze the window.
 type app struct {
-	dir    string
-	path   string
-	sdkLog slog.Logger
+	details       bool
+	tablePage     int
+	prefs         uiprefs.Preferences
+	chainFresh    bool
+	tableErrors   map[string]string
+	submitting    map[string]bool
+	refreshFailed map[string]bool
+	cached        render.View
+	receipt       *session.Receipt
+	exportStatus  string
+	selected      bool
+	cursor        int
+	fieldErrors   map[int]string
+	dir           string
+	path          string
+	sdkLog        slog.Logger
 
 	mu        sync.Mutex
 	cfg       bridgeconn.Config
@@ -78,7 +94,9 @@ func newApp(opts *appconfig.Config, sdkLog slog.Logger) (*app, error) {
 	a := &app{
 		dir: opts.AppData, path: opts.BridgeConfig,
 		cfg: cfg, focus: -1, sdkLog: sdkLog,
+		tableErrors: map[string]string{}, submitting: map[string]bool{}, refreshFailed: map[string]bool{},
 	}
+	a.prefs, _ = uiprefs.Load(opts.AppData)
 	if err != nil {
 		a.status, a.warn = err.Error(), true
 	}
@@ -89,14 +107,20 @@ func newApp(opts *appconfig.Config, sdkLog slog.Logger) (*app, error) {
 func (a *app) lobby() render.Lobby {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	table := a.sid
+	if table == "" {
+		table = a.cached.MatchID
+	}
 	return render.Lobby{
 		Backdrop:   art.LobbyBackdrop(),
 		Network:    a.cfg.Network,
-		Connected:  a.connected,
+		Connected:  a.connected && a.chainFresh,
 		Configured: a.cfg.Complete(),
 		Status:     a.status,
-		Table:      a.sid,
+		Table:      table,
 		Build:      "DEVELOPMENT BUILD",
+		Tables:     a.tableNamesLocked(),
+		TablePage:  a.tablePage,
 	}
 }
 
@@ -112,12 +136,18 @@ func (a *app) settings() render.Settings {
 		{Label: "Client private key", Value: a.cfg.ClientKey, Masked: true, Placeholder: "Click here and paste the complete PEM text"},
 		{Label: "Bridge certificate", Value: a.cfg.BridgeCert, Placeholder: "Click here and paste the complete PEM text"},
 	}
+	for i := range fields {
+		fields[i].Error = a.fieldErrors[i]
+	}
 	if a.focus >= 0 && a.focus < len(fields) {
 		fields[a.focus].Focused = true
+		fields[a.focus].Selected = a.selected
+		fields[a.focus].Cursor = a.cursor
 	}
 	return render.Settings{
 		Network: a.cfg.Network, Fields: fields,
 		Status: a.status, Warn: a.warn, Connected: a.connected,
+		Muted: a.prefs.Muted, Reduced: a.prefs.ReducedMotion, Busy: a.busy,
 	}
 }
 
@@ -125,8 +155,16 @@ func (a *app) settings() render.Settings {
 func (a *app) table() (render.View, bool) {
 	a.mu.Lock()
 	game, sid, network, connected, height := a.game, a.sid, a.cfg.Network, a.connected, a.height
+	stale := !connected || !a.chainFresh || a.refreshFailed[sid]
+	status, pending, cached := a.tableErrors[sid], a.submitting[sid], a.cached
 	a.mu.Unlock()
 	if game == nil || sid == "" {
+		if cached.MatchID != "" {
+			cached.Stale = true
+			cached.Connected = false
+			cached.CanAbandon = false
+			return cached, true
+		}
 		return render.View{}, false
 	}
 	v, ok := game.View(sid)
@@ -134,17 +172,26 @@ func (a *app) table() (render.View, bool) {
 		return render.View{}, false
 	}
 	out := render.View{
+		Network: network, Entries: v.Entries, Results: v.Results, Stake: v.BuyIn, Bond: v.Bond,
+		StakeCheck: v.StakeCheck, BondCheck: v.BondCheck, Blocked: v.Blocked,
+		Stale: stale, Pending: pending, Status: status, MatchDeadline: v.MatchDeadline, Expired: v.Expired,
 		MatchID: v.MatchID, Grid: v.Grid, Seat: v.Seat, Board: v.Board,
 		Turn: v.Turn, Score: v.Score, Moves: v.Moves, Done: v.Done,
-		Won: v.Won, Winner: v.Winner, Connected: connected, Hover: -1,
+		Won: v.Won, Winner: v.Winner, Connected: connected && !stale, Hover: -1,
 		Abandoned: v.Abandoned, Stalled: v.Stalled, Deadline: v.Deadline,
 		Height: height,
 	}
-	out.CanAbandon = !v.Done && !v.Abandoned && v.Turn != v.Seat &&
-		v.Deadline > 0 && height >= v.Deadline
+	out.CanAbandon = !stale && !v.Done && !v.Abandoned &&
+		((v.Turn != v.Seat && v.Deadline > 0 && height >= v.Deadline) || (v.MatchDeadline > 0 && height >= v.MatchDeadline))
 	if !v.Done {
 		out.Notice = "payout needs both seats to sign · " + network
 	}
+	if stale {
+		out.Notice = "Connection unavailable · cached state · reconnect from Settings"
+	}
+	a.mu.Lock()
+	a.cached = out
+	a.mu.Unlock()
 	return out, true
 }
 
@@ -158,6 +205,10 @@ func (a *app) say(status string, warn bool) {
 func (a *app) setField(i int, value string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.connected {
+		return
+	}
+	delete(a.fieldErrors, i)
 	switch i {
 	case fieldHost:
 		a.cfg.Host = strings.TrimSpace(value)
@@ -202,8 +253,15 @@ func (a *app) typed(runes []rune) {
 	}
 	value := a.field(focus)
 	for _, r := range runes {
-		if r >= ' ' && r < 127 && len(value) < 64 {
-			value += string(r)
+		if r >= ' ' && r < 127 && (len(value) < 64 || a.selected) {
+			if a.selected {
+				value = ""
+				a.cursor = 0
+				a.selected = false
+			}
+			a.cursor = min(a.cursor, len(value))
+			value = value[:a.cursor] + string(r) + value[a.cursor:]
+			a.cursor++
 		}
 	}
 	a.setField(focus, value)
@@ -221,18 +279,21 @@ func (a *app) backspace() {
 	if focus < 0 {
 		return
 	}
-	if focus != fieldHost && focus != fieldPort {
+	if a.selected || (focus != fieldHost && focus != fieldPort) {
 		a.setField(focus, "")
+		a.cursor = 0
+		a.selected = false
 		a.say("Cleared the "+strings.ToLower(a.settings().Fields[focus].Label)+" field.", false)
 		return
 	}
-	if v := a.field(focus); v != "" {
-		a.setField(focus, v[:len(v)-1])
+	if v := a.field(focus); v != "" && a.cursor > 0 {
+		a.cursor = min(a.cursor, len(v))
+		a.setField(focus, v[:a.cursor-1]+v[a.cursor:])
+		a.cursor--
 	}
 }
 
-// clearField empties whatever is focused. Delete and Ctrl+A both do it, so a
-// field can be replaced without selecting anything.
+// clearField clears an explicit selection or a pasted credential.
 func (a *app) clearField() {
 	a.mu.Lock()
 	focus := a.focus
@@ -241,6 +302,8 @@ func (a *app) clearField() {
 		return
 	}
 	a.setField(focus, "")
+	a.cursor = 0
+	a.selected = false
 	a.say("Cleared the "+strings.ToLower(a.settings().Fields[focus].Label)+" field.", false)
 }
 
@@ -258,12 +321,33 @@ func (a *app) paste() {
 	}
 	if focus == fieldHost || focus == fieldPort {
 		text = strings.TrimSpace(text)
+		if len(text) > 64 {
+			a.say("Address and port accept at most 64 characters.", true)
+			return
+		}
+		if !a.selected {
+			old := a.field(focus)
+			a.cursor = min(a.cursor, len(old))
+			text = old[:a.cursor] + text + old[a.cursor:]
+		}
+		if len(text) > 64 {
+			return
+		}
+		a.cursor = len(text)
 	}
+	if len(text) > bridgeconn.MaxPEM {
+		a.say("Credential exceeds 32 KiB.", true)
+		return
+	}
+	a.selected = false
 	a.setField(focus, text)
 	a.say("Pasted into the "+strings.ToLower(a.settings().Fields[focus].Label)+" field.", false)
 }
 
 func (a *app) save() {
+	if !a.validateFields() {
+		return
+	}
 	a.mu.Lock()
 	cfg := a.cfg
 	a.mu.Unlock()
@@ -280,9 +364,18 @@ func (a *app) save() {
 // flight: two runtimes over one profile would fight over its stores, and the
 // SDK refuses that anyway.
 func (a *app) connect() {
+	if !a.validateFields() {
+		return
+	}
 	a.mu.Lock()
-	if a.busy || a.connected {
+	if a.busy || (a.connected && a.chainFresh) {
 		a.mu.Unlock()
+		return
+	}
+	if a.connected {
+		a.mu.Unlock()
+		a.disconnect()
+		a.connect()
 		return
 	}
 	a.busy = true
@@ -311,6 +404,18 @@ func (a *app) connect() {
 		}
 		a.say(note, false)
 	}()
+}
+
+func (a *app) validateFields() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.fieldErrors = a.cfg.FieldErrors()
+	if len(a.fieldErrors) > 0 {
+		a.status = "Check the highlighted fields, then connect again."
+		a.warn = true
+		return false
+	}
+	return true
 }
 
 func (a *app) start(cfg bridgeconn.Config) error {
@@ -349,7 +454,17 @@ func (a *app) start(cfg bridgeconn.Config) error {
 	a.game, a.rt, a.cancel, a.connected = game, rt, cancel, true
 	a.mu.Unlock()
 
-	go func() { _ = rt.Run(ctx) }()
+	go func() {
+		if err := rt.Run(ctx); err != nil && ctx.Err() == nil {
+			a.mu.Lock()
+			if a.rt == rt {
+				a.chainFresh = false
+				a.status = "Bridge connection interrupted. Reconnect from Settings."
+				a.warn = true
+			}
+			a.mu.Unlock()
+		}
+	}()
 	go a.follow(ctx, rt)
 	return nil
 }
@@ -360,11 +475,19 @@ func (a *app) follow(ctx context.Context, rt *sdk.Runtime) {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
 	for {
-		if tip, err := rt.Chain(ctx); err == nil {
-			a.mu.Lock()
-			a.height = uint32(tip.Height)
+		tip, err := rt.Chain(ctx)
+		a.mu.Lock()
+		if a.rt != rt || ctx.Err() != nil {
 			a.mu.Unlock()
+			return
 		}
+		if err == nil {
+			a.height = uint32(tip.Height)
+			a.chainFresh = true
+		} else {
+			a.chainFresh = false
+		}
+		a.mu.Unlock()
 		a.prepareTables(ctx)
 		a.settleFinished(ctx)
 		select {
@@ -376,9 +499,23 @@ func (a *app) follow(ctx context.Context, rt *sdk.Runtime) {
 }
 
 func (a *app) disconnect() {
+	_, _ = a.table() // capture the latest board before its session is closed
+	a.mu.Lock()
+	priorGame, priorSID := a.game, a.sid
+	network := a.cfg.Network
+	a.mu.Unlock()
+	if priorGame != nil && priorSID != "" {
+		if r, err := priorGame.Receipt(priorSID); err == nil {
+			r.Network = network
+			a.mu.Lock()
+			a.receipt = &r
+			a.mu.Unlock()
+		}
+	}
 	a.mu.Lock()
 	cancel, game := a.cancel, a.game
 	a.cancel, a.rt, a.game, a.connected, a.sid = nil, nil, nil, false, ""
+	a.chainFresh = false
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -424,7 +561,7 @@ func (a *app) settleFinished(ctx context.Context) {
 			continue
 		}
 		if err := game.Settle(ctx, sid); err != nil {
-			a.say(err.Error(), true)
+			a.tableSay(sid, err.Error())
 		}
 	}
 }
@@ -439,10 +576,10 @@ func (a *app) abandon() {
 	}
 	go func() {
 		if err := game.Abandon(context.Background(), sid); err != nil {
-			a.say(err.Error(), true)
+			a.tableSay(sid, err.Error())
 			return
 		}
-		a.say("The match was given up on. Every seat takes back its own stake.", false)
+		a.tableSay(sid, "Match void. Check settlement or recovery in dcrpulse.")
 	}()
 }
 
@@ -460,11 +597,17 @@ func (a *app) prepareTables(ctx context.Context) {
 	// closed in dcrpulse - all of which are learned here and nowhere else.
 	for _, sid := range game.Tables() {
 		if err := game.Prepare(ctx, sid); err != nil {
-			a.say(err.Error(), true)
+			a.tableSay(sid, err.Error())
+			a.mu.Lock()
+			a.refreshFailed[sid] = true
+			a.mu.Unlock()
 			continue
 		}
+		a.mu.Lock()
+		a.refreshFailed[sid] = false
+		a.mu.Unlock()
 		if err := game.Start(ctx, sid); err != nil {
-			a.say(err.Error(), true)
+			a.tableSay(sid, err.Error())
 		}
 	}
 }
@@ -472,14 +615,25 @@ func (a *app) prepareTables(ctx context.Context) {
 // seating is the table-formation screen's view, or false when there is no table.
 func (a *app) seating() (tablelobby.View, bool) {
 	a.mu.Lock()
-	game, sid, height, connected := a.game, a.sid, a.height, a.connected
+	game, sid, height, connected := a.game, a.sid, a.height, a.connected && a.chainFresh && !a.refreshFailed[a.sid]
+	busy, status, details, network := a.busy, a.tableErrors[sid], a.details, a.cfg.Network
 	a.mu.Unlock()
 	if game == nil || sid == "" {
 		return tablelobby.View{}, false
 	}
 	// Evidence is stale whenever the bridge is gone or the chain height is
 	// unknown: checks made before that are not checks made now.
-	return game.Lobby(sid, height, !connected || height == 0)
+	v, ok := game.Lobby(sid, height, !connected || height == 0)
+	v.Details, v.Network = details, network
+	if busy {
+		v.CanFund = false
+		v.NextStep = "Awaiting dcrpulse approval"
+		v.NextDetail = "A request is in progress. Review it in dcrpulse → Gaming."
+	}
+	if status != "" {
+		v.Error = status
+	}
+	return v, ok
 }
 
 // follow the table through its own lifecycle: the seating screen while it
@@ -512,14 +666,13 @@ func (a *app) followTable() {
 func (a *app) fund() {
 	a.mu.Lock()
 	game, sid, busy := a.game, a.sid, a.busy
-	a.mu.Unlock()
 	if game == nil || sid == "" || busy {
+		a.mu.Unlock()
 		return
 	}
-	a.mu.Lock()
 	a.busy = true
 	a.mu.Unlock()
-	a.say("Requesting the stake. Approve it in dcrpulse.", false)
+	a.tableSay(sid, "Requesting the stake. Approve it in dcrpulse.")
 
 	go func() {
 		defer func() {
@@ -533,13 +686,70 @@ func (a *app) fund() {
 				// may already have been paid, so it must not be asked
 				// again: an operator reconciles it against the bridge's own
 				// record instead.
-				a.say("A stake request was sent and its outcome is unknown. Do NOT fund again — "+
-					"find it in dcrpulse → Gaming and reconcile it there.", true)
+				a.tableSay(sid, "A stake request was sent and its outcome is unknown. Do NOT fund again — "+
+					"find it in dcrpulse → Gaming and reconcile it there.")
 				return
 			}
-			a.say(err.Error(), true)
+			a.tableSay(sid, err.Error())
 			return
 		}
-		a.say("Stake requested. It is asked for once; approve it in dcrpulse.", false)
+		a.tableSay(sid, "")
 	}()
+}
+
+func (a *app) tableSay(sid, message string) { a.mu.Lock(); a.tableErrors[sid] = message; a.mu.Unlock() }
+
+// Called with app lock held; the session never calls back into the app.
+func (a *app) tableNamesLocked() []string {
+	if a.game == nil {
+		return nil
+	}
+	return a.game.Tables()
+}
+
+func (a *app) openReceipt() {
+	a.mu.Lock()
+	game, sid := a.game, a.sid
+	a.mu.Unlock()
+	if game != nil && sid != "" {
+		r, err := game.Receipt(sid)
+		if err != nil {
+			a.tableSay(sid, err.Error())
+			return
+		}
+		a.mu.Lock()
+		a.receipt = &r
+		r.Network = a.cfg.Network
+		a.mu.Unlock()
+	}
+	a.show(screenReceipt)
+}
+
+func (a *app) exportReceipt() {
+	a.openReceipt()
+	a.mu.Lock()
+	r := a.receipt
+	a.mu.Unlock()
+	if r == nil {
+		return
+	}
+	path, err := r.Export(filepath.Join(a.dir, "exports"))
+	note := "Saved: " + path
+	if err != nil {
+		note = "Could not export receipt: " + err.Error()
+	}
+	a.mu.Lock()
+	a.exportStatus = note
+	a.mu.Unlock()
+}
+
+func (a *app) returnToTable() {
+	a.mu.Lock()
+	cached := a.game == nil && a.cached.MatchID != ""
+	a.mu.Unlock()
+	if cached {
+		a.show(screenTable)
+	} else {
+		a.show(screenSeating)
+	}
 }

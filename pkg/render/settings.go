@@ -4,8 +4,9 @@ import "fmt"
 
 // Settings is the bridge connection screen, drawn as a panel over the lobby.
 type Settings struct {
-	Network string
-	Fields  []Field
+	Muted, Reduced, Busy bool
+	Network              string
+	Fields               []Field
 	// Status is the last thing that happened, and Warn colours it as a
 	// problem rather than progress.
 	Status    string
@@ -15,6 +16,9 @@ type Settings struct {
 
 // Field is one editable row.
 type Field struct {
+	Error       string
+	Selected    bool
+	Cursor      int
 	Label       string
 	Value       string
 	Placeholder string
@@ -25,7 +29,7 @@ type Field struct {
 }
 
 // The settings panel, and the rows and buttons inside it.
-const (
+var (
 	panX, panY = 140.0, 56.0
 	panW, panH = Width - 2*panX, Height - 2*panY
 
@@ -71,12 +75,12 @@ func DrawSettings(c Canvas, v Settings) {
 	c.Rect(0, 0, Width, Height, dim)
 	c.Rect(panX, panY, panW, panH, Panel)
 
-	c.Text("BRIDGE CONNECTION", panX+32, panY+24, 22, Turquoise)
+	c.Text("Make the connection", panX+32, panY+24, 26, Turquoise)
 	x, y, w, h := CloseRect()
 	c.Line(x+8, y+8, x+w-8, y+h-8, 2, Muted)
 	c.Line(x+w-8, y+8, x+8, y+h-8, 2, Muted)
 
-	c.Text("Register this game as dcr4inarow in dcrpulse, then paste what it issues.",
+	c.Text("1  Address & network     2  Paste credentials     3  Connect & validate",
 		panX+32, panY+62, 13, Muted)
 
 	// Network. It decides whether the money is real, so it is a choice on
@@ -103,17 +107,41 @@ func DrawSettings(c Canvas, v Settings) {
 		if f.Focused {
 			c.Rect(fx, fy, 3, fh, Turquoise)
 		}
+		if f.Selected {
+			c.Rect(fx+9, fy+5, fw-18, fh-10, Blue)
+		}
 		text, ink := f.Placeholder, Muted
 		if shown := display(f); shown != "" {
 			text, ink = shown, Turquoise
 		}
-		c.Text(text, fx+14, fy+11, 13, ink)
+		if f.Error != "" {
+			text, ink = f.Error, Warn
+			c.Rect(fx, fy, 3, fh, Warn)
+		}
+		clip(c, fx+10, fy+3, fw-20, fh-6).Text(fit(text, fw-28, 13), fx+14, fy+11, 13, ink)
+		if f.Focused && !f.Selected && i < 2 {
+			caret := fx + 14 + Measure(string([]rune(f.Value)[:min(f.Cursor, len([]rune(f.Value)))]), 13)
+			c.Line(caret, fy+9, caret, fy+28, 1, Text)
+		}
 	}
 
-	c.Text("Tab: next field   ·   Ctrl+V: paste   ·   Del or Ctrl+A: clear the field",
-		panX+32, btnY-26, 12, Muted)
+	c.Text("Tab / Shift+Tab: navigate · Ctrl+V: paste · Ctrl+A: select all",
+		panX+32, rowTop+5*rowPitch+6, 11, Muted)
+	for i, label := range []string{"Sound: on", "Motion: normal"} {
+		if i == 0 && v.Muted {
+			label = "Sound: muted"
+		}
+		if i == 1 && v.Reduced {
+			label = "Motion: reduced"
+		}
+		x, y, w, h := PreferenceRect(i)
+		drawButton(c, x, y, w, h, label, Well, Text)
+	}
 
 	for i, name := range ButtonLabels {
+		if v.Busy && i == 0 {
+			name = "CONNECTING…"
+		}
 		bx, by, bw, bh := ButtonRect(i)
 		fill, ink := Well, Turquoise
 		if i == 0 && !v.Connected {
@@ -127,6 +155,7 @@ func DrawSettings(c Canvas, v Settings) {
 	}
 
 	status, ink := v.Status, Muted
+	if v.Connected && !v.Warn { status="Bridge settings are locked while connected. Disconnect to edit." }
 	if status == "" {
 		status = "Not connected. Paste the credentials supplied by dcrpulse."
 	}
@@ -135,7 +164,11 @@ func DrawSettings(c Canvas, v Settings) {
 	} else if v.Connected {
 		ink = Turquoise
 	}
-	c.Text(status, panX+32, panY+panH-44, 13, ink)
+	Wrap(c, status, panX+32, panY+panH-48, panW-64, 12, ink, 2)
+}
+
+func PreferenceRect(i int) (x, y, w, h float64) {
+	return panX + 32 + float64(i)*206, btnY - 54, 194, 32
 }
 
 var networkNames = []string{"mainnet", "testnet3", "simnet"}

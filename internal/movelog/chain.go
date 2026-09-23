@@ -59,7 +59,14 @@ func (c *Chain) MatchID() string { return c.matchID }
 func (c *Chain) Len() int        { return len(c.entries) }
 
 // Entries is a copy of the chain so far.
-func (c *Chain) Entries() []Entry { return append([]Entry(nil), c.entries...) }
+func (c *Chain) Entries() []Entry {
+	out := append([]Entry(nil), c.entries...)
+	for i := range out {
+		out[i].Signer = append([]byte(nil), out[i].Signer...)
+		out[i].Sig = append([]byte(nil), out[i].Sig...)
+	}
+	return out
+}
 
 // Signer is the key a seat signs with, and whether the seat is at this table.
 func (c *Chain) Signer(seat uint32) ([]byte, bool) {

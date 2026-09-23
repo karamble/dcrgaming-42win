@@ -10,8 +10,8 @@ import (
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
-	"github.com/karamble/dcr4inarow/internal/manifest"
-	"github.com/karamble/dcr4inarow/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/manifest"
+	"github.com/karamble/dcrgaming-42win/internal/match"
 	"github.com/karamble/dcrgaming-sdk/pkg/forfeit"
 	"github.com/karamble/dcrgaming-sdk/pkg/gaming/wire"
 )

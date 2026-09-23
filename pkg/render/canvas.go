@@ -10,7 +10,7 @@ import (
 	"image"
 	"image/color"
 
-	"github.com/karamble/dcr4inarow/internal/board"
+	"github.com/karamble/dcrgaming-42win/internal/board"
 )
 
 // Canvas is every drawing operation this game needs. Deliberately small: a
@@ -24,12 +24,12 @@ type Canvas interface {
 }
 
 // The window, and where the board sits in it.
-const (
-	Width  = 960
-	Height = 640
+var (
+	Width  = 960.0
+	Height = 640.0
 
 	BoardX = 40.0
-	BoardY = 96.0
+	BoardY = 110.0
 	Cell   = 72.0
 	Hole   = 28.0
 
@@ -42,14 +42,14 @@ const (
 
 // Decred's colours: deep navy, blue and turquoise.
 var (
-	Navy      = color.RGBA{9, 20, 64, 255}
-	Panel     = color.RGBA{15, 32, 67, 255}
+	Navy      = color.RGBA{7, 16, 32, 255}
+	Panel     = color.RGBA{17, 34, 54, 255}
 	Well      = color.RGBA{6, 14, 44, 255}
 	Hollow    = color.RGBA{4, 10, 32, 255}
 	Turquoise = color.RGBA{46, 216, 163, 255}
 	Blue      = color.RGBA{41, 112, 255, 255}
 	Text      = color.RGBA{232, 240, 255, 255}
-	Muted     = color.RGBA{122, 140, 176, 255}
+	Muted     = color.RGBA{158, 178, 199, 255}
 	Warn      = color.RGBA{240, 176, 96, 255}
 
 	// dim is drawn over the lobby when a panel is open. Translucent, so the

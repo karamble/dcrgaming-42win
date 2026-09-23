@@ -58,6 +58,14 @@ func (g *GPU) Text(s string, x, y, size float64, c color.RGBA) {
 	text.Draw(g.Target, s, face, int(x), int(y+size), color.NRGBA(c))
 }
 
+func (g *GPU) TextWeight(s string, x, y, size float64, ink color.RGBA, bold bool) {
+	text.Draw(g.Target, s, textFace(size, bold), int(x), int(y+size), color.NRGBA(ink))
+}
+
+func (g *GPU) Clip(box image.Rectangle) Canvas {
+	return &GPU{Target: g.Target.SubImage(box.Intersect(g.Target.Bounds())).(*ebiten.Image), faces: g.faces, sprites: g.sprites, normal: g.normal, bold: g.bold}
+}
+
 func (g *GPU) Image(src image.Image, x, y, w, h float64) {
 	if src == nil || w <= 0 || h <= 0 {
 		return

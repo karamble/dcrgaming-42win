@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/karamble/dcr4inarow/internal/bridgeconn"
-	"github.com/karamble/dcr4inarow/internal/session"
+	"github.com/karamble/dcrgaming-42win/internal/bridgeconn"
+	"github.com/karamble/dcrgaming-42win/internal/session"
 	"github.com/karamble/dcrgaming-sdk/pkg/identity"
 	sdk "github.com/karamble/dcrgaming-sdk/pkg/runtime"
 )

@@ -3,8 +3,9 @@
 package main
 
 import (
-	"github.com/karamble/dcr4inarow/internal/match"
-	"github.com/karamble/dcr4inarow/pkg/render"
+	"github.com/karamble/dcrgaming-42win/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/movelog"
+	"github.com/karamble/dcrgaming-42win/pkg/render"
 )
 
 // local is a fixture board driven from one keyboard.
@@ -12,11 +13,15 @@ import (
 // An engineering tool, not a way to play: there is no log, no signature, no
 // bridge and no money in it. It exists so the window, the drawing and the input
 // can be exercised without a table.
-type local struct{ m *match.Match }
+type local struct {
+	m       *match.Match
+	entries []movelog.Entry
+}
 
 func (l *local) View() render.View {
 	winner, won, done := l.m.Outcome()
 	v := render.View{
+		Entries: append([]movelog.Entry(nil), l.entries...), Results: l.m.Results(), Network: "FIXTURE", Stake: 100000,
 		MatchID: "local fixture",
 		Grid:    *l.m.Board(),
 		Seat:    l.m.Turn(), // whoever is to move is "you" at one keyboard
@@ -36,7 +41,12 @@ func (l *local) View() render.View {
 }
 
 func (l *local) Play(column int) error {
-	return l.m.Play(match.Move{Board: uint8(l.m.Index()), Seat: l.m.Turn(), Column: uint8(column)})
+	e := movelog.Entry{Board: uint8(l.m.Index()), Seat: l.m.Turn(), Column: uint8(column), Seq: uint64(len(l.entries))}
+	if err := l.m.Play(match.Move{Board: e.Board, Seat: e.Seat, Column: e.Column}); err != nil {
+		return err
+	}
+	l.entries = append(l.entries, e)
+	return nil
 }
 
 func openFixture() (source, error) {

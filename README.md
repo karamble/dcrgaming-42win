@@ -1,6 +1,10 @@
-# dcr4inarow
+# FOUR2WIN
 
 Heads-up four-in-a-row for real stakes on Decred, over Bison Relay.
+
+FOUR2WIN is the player-facing brand. The repository and Go module are
+`github.com/karamble/dcrgaming-42win`. Executable names, existing profile paths
+and bridge protocol identifiers are unchanged by the repository rename.
 
 Two seats, best of three boards, first to two wins takes the pot. Every move is a
 signed entry in one hash-chained log, so a finished match verifies offline from
@@ -14,21 +18,43 @@ that dashboard approves every payment.
 
 ## Building
 
-Requires Go 1.25 and the sibling SDK checkout:
+Requires Go 1.26 and the sibling SDK checkout:
 
 ```text
 karamble/
   dcrgaming-sdk/
-  dcr4inarow/
+  dcrgaming-42win/
 ```
 
 ```sh
 make check      # race tests, vet, both desktop builds
 make preview    # every screen to PNG, no display needed
+make ui-check   # actual desktop/GPU fixture walkthrough (requires a display)
 make play       # the local fixture board
 ```
 
 ## Running it
+
+The illustrated cover prepares local artwork, then Enter, Space or a click
+opens the lobby. It never waits for a bridge or imposes an artificial delay.
+`--skip-cover` bypasses it; `--settings` and `--dev-board` also skip the cover.
+The window starts at 1280×800 and adapts down to 960×640.
+
+Use the mouse to choose a column, or Left/Right and Enter/Space to drop. Tab
+and Shift+Tab move between controls; Escape returns to the lobby. Round results
+remain visible briefly before the next board; Enter/Space can dismiss a round
+presentation. Settings includes sound and reduced-motion toggles, saved in the
+profile's `ui.json`. Bridge settings must be disconnected before editing them.
+
+The result screen separates the match outcome from bridge observations.
+“Stake spend in progress” and “Stake reported spent” do not promise confirmed
+winnings. Payment approvals and recovery remain in dcrpulse → Gaming.
+
+Open **Match receipt** after a result to export the signed transcript, reference
+roster, round results, accepted terms, and any signed abandonment. Exports are
+unique owner-only JSON files in `APPDATA/exports/`. Their descriptive metadata
+is not signed payment evidence. Independently verify moves with `audit.Match`
+and a trusted roster obtained from escrow, not solely the exported roster.
 
 It follows Decred's conventions, so it should behave like the node and wallet
 beside it. The application directory comes from `dcrutil`, a
@@ -49,6 +75,7 @@ dcr4inarow -A ~/.dcr4inarow-two --connect    # a second seat, its own identity
 | `-d`, `--debuglevel` | `info`, or `SESS=debug,SDK=warn`; `show` lists subsystems |
 | `--bridge-config` | credential file (default `APPDATA/bridge.json`) |
 | `--connect`, `--settings` | connect at startup, or open bridge settings |
+| `--skip-cover` | bypass the illustrated startup screen |
 
 Logging is Decred `slog` with four subsystems — `FOUR` the client, `SESS` the
 rules and move log, `SDK` the gaming runtime, `BRDG` the bridge connection —
@@ -91,6 +118,12 @@ checks made before a disconnect are not checks made now.
 
 `make preview` renders every stage, including the ones that are awkward to reach
 on purpose: a bond one confirmation short, an aborted table, stale evidence.
+It also renders loading, round/result, financial-status, help and receipt
+screens, with representative layouts at 960×640, 1280×800 and 1920×1080.
+
+`make ui-check` opens a temporary fixture window, exercises the real input
+handlers and GPU renderer, plays three rounds, and captures application-only
+screenshots below `/tmp/dcr4inarow-ui-walkthrough-*`. No bridge or wallet is used.
 
 ## What does not
 

@@ -8,8 +8,8 @@ package audit
 import (
 	"fmt"
 
-	"github.com/karamble/dcr4inarow/internal/match"
-	"github.com/karamble/dcr4inarow/internal/movelog"
+	"github.com/karamble/dcrgaming-42win/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/movelog"
 )
 
 // Moves is the move list a chain records, in order.

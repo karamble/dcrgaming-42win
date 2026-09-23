@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/karamble/dcr4inarow/internal/audit"
-	"github.com/karamble/dcr4inarow/internal/match"
-	"github.com/karamble/dcr4inarow/internal/movelog"
+	"github.com/karamble/dcrgaming-42win/internal/audit"
+	"github.com/karamble/dcrgaming-42win/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/movelog"
 	"github.com/karamble/dcrgaming-sdk/pkg/forfeit"
 )
 

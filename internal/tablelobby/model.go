@@ -218,11 +218,13 @@ func (t Terms) PerSeat() int64 { return t.BuyInAtoms + t.BondAtoms }
 
 // View is the whole screen, detached.
 type View struct {
-	Match  string
-	Stage  Stage
-	Seats  []Seat
-	Terms  Terms
-	Height uint32
+	Details bool
+	Network string
+	Match   string
+	Stage   Stage
+	Seats   []Seat
+	Terms   Terms
+	Height  uint32
 
 	// NextStep is what the table is waiting for and NextDetail why, in a
 	// sentence a player can act on.

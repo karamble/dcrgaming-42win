@@ -3,12 +3,12 @@ package render
 import (
 	"fmt"
 
-	"github.com/karamble/dcr4inarow/internal/tablelobby"
+	"github.com/karamble/dcrgaming-42win/internal/tablelobby"
 )
 
 // The seating screen's geometry. Exported where the client hit-tests it, so
 // drawing and input cannot hold different opinions about where a control is.
-const (
+var (
 	railY     = 104.0
 	railStepW = (Width - 80) / 6.0
 
@@ -30,7 +30,8 @@ func SeatCardRect(i int) (x, y, w, h float64) {
 
 // FundRect is the stake-funding action, and LobbyBackRect returns to the
 // opening screen.
-func FundRect() (x, y, w, h float64) { return termsX, Height - 96, termsW, 40 }
+func FundRect() (x, y, w, h float64)    { return termsX, Height - 96, termsW, 40 }
+func DetailsRect() (x, y, w, h float64) { return Width - 260, 24, 220, 34 }
 func LobbyBackRect() (x, y, w, h float64) {
 	return 40, Height - 96, 180, 40
 }
@@ -38,14 +39,20 @@ func LobbyBackRect() (x, y, w, h float64) {
 // DrawTableLobby draws a table while it is being built.
 func DrawTableLobby(c Canvas, v tablelobby.View) {
 	c.Rect(0, 0, Width, Height, Navy)
-	drawEmblem(c, 40, 20, 40)
-	c.Text("dcr4inarow", 92, 28, 20, Text)
+	drawWordmark(c, 40, 12, 196, 48)
 	if v.Demo {
 		c.Text("FIXTURE · NO WALLET, NO PEER, NO MONEY", 260, 32, 12, Warn)
 	} else if v.Match != "" {
 		c.Text("table "+short(v.Match), 260, 32, 12, Muted)
 	}
 	c.Line(40, 76, Width-40, 76, 1, Panel)
+	dx, dy, dw, dh := DetailsRect()
+	label := "Terms & recovery"
+	if v.Details {
+		label = "Close details"
+	}
+	drawButton(c, dx, dy, dw, dh, label, Well, Text)
+	c.Text(upper(v.Network), 40, 80, 10, Turquoise)
 
 	drawRail(c, v)
 	for i := range v.Seats {
@@ -61,14 +68,23 @@ func DrawTableLobby(c Canvas, v tablelobby.View) {
 	x, y, w, h := LobbyBackRect()
 	drawButton(c, x, y, w, h, "< BACK", Panel, Text)
 	fx, fy, fw, fh := FundRect()
-	label, fill, ink := "WAITING FOR VERIFICATION", Panel, Muted
+	label, fill, ink := "Waiting for verification", Panel, Muted
 	switch {
 	case v.Stage == tablelobby.StageReady:
-		label, fill, ink = "ENTER · PLAY", Turquoise, Navy
+		label, fill, ink = "Starting match…", Panel, Muted
 	case v.CanFund:
 		label, fill, ink = "F · REQUEST STAKE FUNDING", Turquoise, Navy
 	}
 	drawButton(c, fx, fy, fw, fh, label, fill, ink)
+	Wrap(c, "Payout needs both players. A stalled opponent cannot lose their stake. Recovery returns your own deposit after its lock, less fees.", 40, Height-46, Width-80, 11, Warn, 2)
+	if v.Details {
+		rounded(c, 40, 176, Width-80, Height-296, 12, Panel)
+		c.Text("Know the terms before funding", 64, 195, 24, Text)
+		text := fmt.Sprintf("Stake: %s DCR per seat. Admission bond: %s DCR. Gross pot: %s DCR. Stake lock: %d blocks; bond lock: %d blocks.", tablelobby.DCR(v.Terms.BuyInAtoms), tablelobby.DCR(v.Terms.BondAtoms), tablelobby.DCR(v.Terms.Pot()), v.Terms.RefundBlocks, v.Terms.BondBlocks)
+		y := Wrap(c, text, 64, 242, Width-128, 16, Text, 4)
+		y = Wrap(c, "Seat 0 opens round one; seat 1 opens round two. The player whose round win used fewer moves opens the decider; ties fall back to seat 0.", 64, y+16, Width-128, 14, Muted, 3)
+		Wrap(c, "Payout requires both players to sign. If a player stops, the match can become void: you recover your own stake, not theirs. Manage approvals and any mature recovery in dcrpulse → Gaming. Locks and fees apply.", 64, y+16, Width-128, 14, Warn, 4)
+	}
 }
 
 // drawRail is the numbered progress bar: done, current, and not yet.
@@ -104,14 +120,14 @@ func drawRail(c Canvas, v tablelobby.View) {
 func drawSeatCard(c Canvas, v tablelobby.View, i int) {
 	s := v.Seats[i]
 	x, y, w, h := SeatCardRect(i)
-	c.Rect(x, y, w, h, Panel)
+	rounded(c, x, y, w, h, 10, Panel)
 	c.Rect(x, y, 4, h, SeatColour(s.Number))
 
 	c.Text(fmt.Sprintf("SEAT %02d", s.Number), x+20, y+14, 11, Muted)
 	if s.You {
 		c.Text("YOU", x+w-52, y+14, 11, Turquoise)
 	}
-	c.Text(s.Name, x+20, y+32, 19, Text)
+	c.Text(fit(s.Name, w-40, 19), x+20, y+32, 19, Text)
 
 	status, ink := s.StatusAt(v.Stale), Warn
 	if !v.Stale && status == "ready" {
@@ -154,7 +170,7 @@ func drawSeatCard(c Canvas, v tablelobby.View, i int) {
 
 func drawTerms(c Canvas, v tablelobby.View) {
 	x, y, w, h := termsX, seatY, termsW, seatH+stepH+16
-	c.Rect(x, y, w, h, Panel)
+	rounded(c, x, y, w, h, 10, Panel)
 	c.Text("TABLE TERMS", x+20, y+14, 12, Muted)
 
 	c.Text(tablelobby.DCR(v.Terms.BuyInAtoms)+" DCR", x+20, y+34, 22, Turquoise)
@@ -178,19 +194,19 @@ func drawTerms(c Canvas, v tablelobby.View) {
 	} else if v.Terms.Until > 0 {
 		c.Text(fmt.Sprintf("Admission closed at %d", v.Terms.Until), x+20, y+202, 11, Muted)
 	}
-	c.Text("Winner takes the pot. Bonds come back.", x+20, y+226, 11, Muted)
+	c.Text("Gross pot; payout fees apply.", x+20, y+226, 11, Muted)
 	c.Text("Payout needs both seats to sign; if it", x+20, y+244, 11, Muted)
 	c.Text("fails you reclaim your own stake.", x+20, y+262, 11, Muted)
 }
 
 func drawNextStep(c Canvas, v tablelobby.View) {
 	x, y, w, h := 40.0, stepY, 2*seatW+16, stepH
-	c.Rect(x, y, w, h, Panel)
+	rounded(c, x, y, w, h, 10, Panel)
 	c.Rect(x, y, 3, h, Warn)
 	c.Text("NEXT STEP", x+20, y+14, 11, Muted)
-	c.Text(v.NextStep, x+20, y+34, 19, Text)
-	c.Text(v.NextDetail, x+20, y+68, 12, Muted)
+	c.Text(fit(v.NextStep, w-40, 19), x+20, y+34, 19, Text)
+	Wrap(c, v.NextDetail, x+20, y+62, w-40, 12, Muted, 2)
 	if v.Error != "" {
-		c.Text(v.Error, x+20, y+86, 11, Warn)
+		Wrap(c, v.Error, x+20, y+h+8, w-40, 11, Warn, 2)
 	}
 }

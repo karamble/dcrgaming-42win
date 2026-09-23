@@ -27,6 +27,7 @@ const (
 
 // Options is every setting, from the command line or the INI file.
 type Options struct {
+	SkipCover    bool   `long:"skip-cover" ini-name:"skip-cover" description:"Skip the illustrated startup cover"`
 	AppData      string `short:"A" long:"appdata" ini-name:"appdata" description:"Application directory for configuration, identity, saved tables and logs"`
 	DataDir      string `long:"datadir" ini-name:"datadir" description:"Alias for --appdata; use a different directory for each identity"`
 	ConfigFile   string `short:"C" long:"configfile" ini-name:"configfile" description:"Configuration file (default: APPDATA/dcr4inarow.conf)"`

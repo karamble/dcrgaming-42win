@@ -10,7 +10,7 @@ package match
 import (
 	"fmt"
 
-	"github.com/karamble/dcr4inarow/internal/board"
+	"github.com/karamble/dcrgaming-42win/internal/board"
 )
 
 // Boards is the ceiling, Wins is what takes the pot.

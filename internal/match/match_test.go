@@ -3,8 +3,8 @@ package match_test
 import (
 	"testing"
 
-	"github.com/karamble/dcr4inarow/internal/board"
-	"github.com/karamble/dcr4inarow/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/board"
+	"github.com/karamble/dcrgaming-42win/internal/match"
 )
 
 // Column orders that finish a board, played by whoever is to move. The opener

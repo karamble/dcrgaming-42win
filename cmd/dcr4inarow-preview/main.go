@@ -9,32 +9,84 @@ import (
 	"fmt"
 	"image/png"
 	"os"
+	"strings"
 
-	"github.com/karamble/dcr4inarow/assets/art"
-	"github.com/karamble/dcr4inarow/internal/match"
-	"github.com/karamble/dcr4inarow/internal/tablelobby"
-	"github.com/karamble/dcr4inarow/pkg/render"
+	"github.com/karamble/dcrgaming-42win/assets/art"
+	"github.com/karamble/dcrgaming-42win/internal/board"
+	"github.com/karamble/dcrgaming-42win/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/tablelobby"
+	"github.com/karamble/dcrgaming-42win/pkg/render"
 )
 
 func main() {
 	out := flag.String("output", "artifacts/dcr4inarow-table.png", "PNG output path")
 	stage := flag.String("stage", "midgame",
 		"which screen: lobby, lobby-connected, settings, opening, midgame, won, "+
-			"or table-invitation|admission|roster|draw|stake|ready|closed|stale")
+			"cover[-loading|-error], help, receipt, pending, disconnected, round-win, lost, void, spending, spent, blocked, "+
+			"or table-invitation|admission|roster|draw|stake|ready|closed|stale|details")
 	hover := flag.Int("hover", 4, "column under the pointer, -1 for none")
+	width := flag.Int("width", 960, "logical window width")
+	height := flag.Int("height", 640, "logical window height")
 	flag.Parse()
+	render.SetSize(*width, *height)
 
 	raster := render.NewRaster()
 	switch {
+	case strings.HasPrefix(*stage, "cover"):
+		v := render.Cover{Ready: *stage != "cover-loading", Frame: 18}
+		if *stage == "cover-error" {
+			v.Error = "Artwork unavailable"
+		}
+		render.DrawCover(raster, v)
+	case *stage == "help":
+		render.DrawHelp(raster, "simnet")
+	case *stage == "receipt":
+		v, _ := scene("won", -1)
+		v.StakeCheck = "spending"
+		render.DrawReceipt(raster, v, "Export includes transcript and reference roster.")
 	case len(*stage) > 6 && (*stage)[:6] == "table-":
 		drawSeating(raster, (*stage)[6:])
 	case *stage == "lobby" || *stage == "lobby-connected" || *stage == "settings":
 		drawLobbyish(raster, *stage)
 	default:
-		view, err := scene(*stage, *hover)
+		base := *stage
+		switch base {
+		case "pending", "disconnected", "round-win", "void":
+			base = "midgame"
+		case "lost", "spending", "spent", "blocked":
+			base = "won"
+		}
+		view, err := scene(base, *hover)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
+		}
+		switch *stage {
+		case "pending":
+			view.Pending = true
+		case "disconnected":
+			view.Stale = true
+			view.Connected = false
+			view.Notice = "Cached state · reconnect from Settings to recheck the bridge"
+		case "round-win":
+			view.RoundMessage = "You won round 1"
+			grid := board.New()
+			for i, col := range openerWinsIn7 {
+				_, _ = grid.Drop(int(col), uint32(i%2))
+			}
+			view.Grid = *grid
+			view.Board = 0
+			view.Turn = 1
+		case "lost":
+			view.Seat = 1
+		case "void":
+			view.Done = true
+			view.Won = false
+			view.Abandoned = true
+		case "spending", "spent":
+			view.StakeCheck = *stage
+		case "blocked":
+			view.Blocked = "Approval is required in dcrpulse"
 		}
 		render.DrawTable(raster, view)
 	}
@@ -91,6 +143,8 @@ func scene(stage string, hover int) (render.View, error) {
 
 	winner, won, done := m.Outcome()
 	view := render.View{
+		StakeCheck: "verified",
+		Results:    m.Results(), Network: "SIMNET", Bond: 1000000,
 		MatchID:   "641be69ec6100361ff3e35357355c9d1",
 		Grid:      *m.Board(),
 		Seat:      0,
@@ -103,7 +157,7 @@ func scene(stage string, hover int) (render.View, error) {
 		Winner:    winner,
 		Connected: true,
 		Hover:     hover,
-		Stake:     5_000_000,
+		Stake:     100_000,
 	}
 	for _, r := range m.Results() {
 		view.Moves += r.Moves
@@ -149,6 +203,10 @@ const certSample = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAJ2m0p0Y3JmpMA0GCSq
 
 // drawSeating renders one stage of the table seating screen from a fixture.
 func drawSeating(c render.Canvas, name string) {
+	details := name == "details"
+	if details {
+		name = "stake"
+	}
 	stages := map[string]tablelobby.Stage{
 		"invitation": tablelobby.StageInvitation,
 		"admission":  tablelobby.StageAdmission,
@@ -168,6 +226,8 @@ func drawSeating(c render.Canvas, name string) {
 		os.Exit(1)
 	}
 	v := tablelobby.Fixture(stage)
+	v.Details = details
+	v.Network = "SIMNET"
 	if stale {
 		v.Stale = true
 		v.NextStep, v.NextDetail = tablelobby.Guidance(v)

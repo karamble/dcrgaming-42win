@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/karamble/dcr4inarow/internal/match"
+	"github.com/karamble/dcrgaming-42win/internal/match"
 	"github.com/karamble/dcrgaming-sdk/pkg/gaming/schema"
 	"github.com/karamble/dcrgaming-sdk/pkg/membership"
 )

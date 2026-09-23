@@ -6,7 +6,7 @@ authoritative, and where the two disagree the code is right and this file is sta
 
 ## Product
 
-- Name: **dcr4inarow**. Go module: `github.com/karamble/dcr4inarow`.
+- Name: **dcr4inarow**. Go module: `github.com/karamble/dcrgaming-42win`.
 - Go/Ebiten native desktop game, same stack as dcrstakewars.
 - **Two seats maximum.** Standard 7×6 board.
 - Every match is staked. No solo mode, no hotseat, no unpaid public demo.

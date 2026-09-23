@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/karamble/dcr4inarow/internal/tablelobby"
+	"github.com/karamble/dcrgaming-42win/internal/tablelobby"
 	sdk "github.com/karamble/dcrgaming-sdk/pkg/runtime"
 )
 

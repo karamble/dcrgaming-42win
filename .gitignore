@@ -1,1 +1,13 @@
 *.log
+
+# Local screenshots, build outputs and downloaded tools must not be committed.
+/artifacts/
+/bin/
+/dist/
+/.tools/
+/dcr4inarow
+/dcr4inarow-dev
+/dcr4inarow-preview
+/dcr4inarow-simnet-player
+*.exe
+*.test

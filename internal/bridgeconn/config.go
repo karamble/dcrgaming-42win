@@ -97,6 +97,36 @@ func (c Config) Complete() bool {
 	return c.ClientCert != "" && c.ClientKey != "" && c.BridgeCert != ""
 }
 
+// FieldErrors names individual setup problems without echoing credential data.
+// Indices match address, port, client certificate, private key, bridge certificate.
+func (c Config) FieldErrors() map[int]string {
+	out := map[int]string{}
+	if net.ParseIP(strings.Trim(strings.TrimSpace(c.Host), "[]")) == nil {
+		out[0] = "Enter an IPv4 or IPv6 address"
+	}
+	p, err := strconv.Atoi(c.Port)
+	if err != nil || p < 1 || p > 65535 {
+		out[1] = "Port must be between 1 and 65535"
+	}
+	for i, value := range []string{c.ClientCert, c.ClientKey, c.BridgeCert} {
+		if len(value) == 0 {
+			out[i+2] = "Paste this credential from dcrpulse"
+		} else if len(value) > MaxPEM {
+			out[i+2] = "Credential exceeds 32 KiB"
+		}
+	}
+	if out[2] == "" && out[3] == "" {
+		if _, err := tls.X509KeyPair([]byte(c.ClientCert), []byte(c.ClientKey)); err != nil {
+			out[2] = "Certificate / private key do not match"
+			out[3] = "Check this key against the client certificate"
+		}
+	}
+	if out[4] == "" && !x509.NewCertPool().AppendCertsFromPEM([]byte(c.BridgeCert)) {
+		out[4] = "Paste a valid bridge certificate"
+	}
+	return out
+}
+
 // Load reads saved settings, or returns the defaults if there are none.
 func Load(path string) (Config, error) {
 	c := Defaults()

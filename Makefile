@@ -27,16 +27,32 @@ play: dev
 
 # Table screens to PNG, with no display.
 preview:
-	mkdir -p artifacts
-	$(GO) run ./cmd/dcr4inarow-preview -stage opening -hover 3 -output artifacts/dcr4inarow-opening.png
-	$(GO) run ./cmd/dcr4inarow-preview -stage midgame -hover 4 -output artifacts/dcr4inarow-table.png
-	$(GO) run ./cmd/dcr4inarow-preview -stage won -hover -1 -output artifacts/dcr4inarow-won.png
-	$(GO) run ./cmd/dcr4inarow-preview -stage lobby -output artifacts/dcr4inarow-lobby.png
-	$(GO) run ./cmd/dcr4inarow-preview -stage settings -output artifacts/dcr4inarow-settings.png
+	mkdir -p artifacts $(BIN)
+	$(GO) build -o $(BIN)/dcr4inarow-preview ./cmd/dcr4inarow-preview
+	$(BIN)/dcr4inarow-preview -stage midgame -hover 4 -output artifacts/dcr4inarow-table.png
+	for stage in opening won lobby lobby-connected settings cover cover-loading cover-error help pending disconnected round-win lost void spending spent blocked receipt; do \
+		$(BIN)/dcr4inarow-preview -stage $$stage -output artifacts/dcr4inarow-$$stage.png; \
+	done
 	for stage in invitation admission roster draw stake ready closed stale; do \
-		$(GO) run ./cmd/dcr4inarow-preview -stage table-$$stage \
+		$(BIN)/dcr4inarow-preview -stage table-$$stage \
 			-output artifacts/dcr4inarow-seating-$$stage.png; \
 	done
+	$(BIN)/dcr4inarow-preview -stage table-details -output artifacts/dcr4inarow-terms.png
+	for size in 1280x800 1920x1080; do \
+		for stage in cover lobby settings table-stake midgame won receipt; do \
+			$(BIN)/dcr4inarow-preview -stage $$stage -width $${size%x*} -height $${size#*x} -output artifacts/dcr4inarow-$$stage-$$size.png; \
+		done; \
+	done
+	mkdir -p artifacts/four2win
+	for stage in cover cover-loading lobby settings table-stake midgame won receipt; do \
+		$(BIN)/dcr4inarow-preview -stage $$stage -width 1280 -height 800 \
+			-output artifacts/four2win/$$stage.png; \
+	done
+
+# Requires a desktop display. Uses a temporary profile and no bridge or wallet.
+.PHONY: ui-check
+ui-check:
+	$(GO) test -tags desktop,dev ./cmd/dcr4inarow -count=1 -v
 
 # Two independent wallets, bridges and games on simnet. Builds the whole stack
 # from the sibling source trees and needs docker. Nothing here touches mainnet.
